@@ -1,0 +1,17 @@
+node_modules/
+release/
+out/
+tmp/
+__pycache__/
+*.pyc
+dist/
+electron-dist/
+build/
+*.spec
+
+# 職員データ・配布物は入れない（名簿 staff_YYYYMMDD.csv / staffs (N).csv / 元表・DTX14 の xlsx/xlsm）
+staff*.csv
+*.xlsx
+*.xlsm
+*.pdf
+!data/holidays.csv

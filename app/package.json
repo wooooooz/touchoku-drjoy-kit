@@ -1,0 +1,36 @@
+{
+  "name": "touchoku-duty-form",
+  "version": "1.0.0",
+  "description": "当直勤務表 入力アプリ (Electron)",
+  "main": "main.js",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win"
+  },
+  "build": {
+    "appId": "jp.hospital.touchokuduty",
+    "productName": "当直勤務表入力",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**",
+      "lib/**"
+    ],
+    "win": {
+      "target": "portable",
+      "artifactName": "当直勤務表入力(Win).${ext}",
+      "signAndEditExecutable": false
+    },
+    "directories": {
+      "output": "release"
+    },
+    "electronDist": "electron-dist"
+  },
+  "devDependencies": {
+    "electron": "42.5.0",
+    "electron-builder": "^26.15.3"
+  }
+}

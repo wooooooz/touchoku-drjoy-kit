@@ -1,0 +1,12 @@
+{
+  "schema": "hospital.naika-ippan-members/1",
+  "note": "内科（ファースト）の初期メンバーに入れる医師の見本。login は Dr.JOY のログインID。",
+  "owner": "内科",
+  "members": [
+    {
+      "login": "user101@example.ac.jp",
+      "name": "見本 太郎",
+      "rank": "教"
+    }
+  ]
+}

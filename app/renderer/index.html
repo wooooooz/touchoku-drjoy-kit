@@ -1,0 +1,2411 @@
+<!DOCTYPE html>
+<!--
+  renderer/index.html — 当直勤務表 入力アプリ（Electron renderer 兼 Mac用自己完結HTMLの原本）。
+  window.td があれば Electron（IPC経由・提出は共有へ書込）、無ければブラウザ単体
+  （設定は #cfgdata の埋め込みJSON・提出はダウンロード保存）。
+  設計案§2: 氏名は絶対に手入力させない（名簿からの選択のみ）。①の名簿が所属医師の申告を兼ねる。
+  20260831 ユーザー決定: バンドは常に昼/夜の2区分（「全日」「昼夜」バンドは廃止。マスのキーも
+  枠×日×昼/夜）。枠ごとの「昼夜共通」スイッチ（ON=1回の入力を昼と夜の両方に保存・
+  現行の全日枠は既定ON=frames.jsonのshare_day_night）で、見た目は従来の全日セルを保てる。
+  20260922 管理者決定: 全日タイプ／昼夜タイプは月ごとにデータから決める。スイッチの初期状態は
+  その月の土日祝の実データ（昼と夜の顔ぶれが全日同じならON）→ 空の月は前月のタイプ→枠マスタの固定値。
+  20261106
+  20260927: ①の名簿＝Dr.JOY の所属医師の申告（見出しと常に見える帯）・区分はフルタイム／パートタイム／院外研修専従の3つ・
+  まだ出していない月は前月の名簿から引き継ぐ・提出の確認に所属医師の変化を出す（院外研修期間表の初期区分はやめた）
+  20260926: 開いたままの画面が③確定・解除に追いつく（科の切替と提出の直前に読み直す）・同じ人の2回入りは出させない・
+  当番当直の欄は空で出させない・取込の注意（warnings）を △ で出す・違う月の書き出しは共有の予定から
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>当直勤務表</title>
+<style>
+  :root{
+    --bg:#eef0f5; --panel:#ffffff; --line:#d8dce6; --ink:#2c3650; --muted:#7b8398;
+    --accent:#3f5bd6; --accent-soft:#e8edfb; --ok:#1f9d6b; --ng:#d64545; --warn:#c07b12;
+    --sat:#3f7fd6; --sun:#d64545;
+    --font:-apple-system,BlinkMacSystemFont,'Segoe UI','Hiragino Kaku Gothic ProN','Yu Gothic UI','Meiryo',sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;}
+  body{color:var(--ink);font-family:var(--font);font-size:14px;background:var(--bg);
+    display:flex;flex-direction:column;height:100vh;overflow:hidden;}
+  .topbar{flex:none;display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;padding:10px 16px;background:#2c3650;color:#fff;}  /* 拡大して狭くなったら月の札を次の行へ（20260927） */
+  .topbar h1{font-size:24px;font-weight:700;margin:0;white-space:nowrap;letter-spacing:.06em;}
+  .topbar .dl{font-size:13px;color:#ffd479;white-space:nowrap;}
+  /* 対象月の帯（20260909 ユーザー決定: 月フォルダ方式。開き違いを一目で分かるように大きく・月ごとに色を変える） */
+  /* 月の札（20260927 管理者「見た目が古くさい」→ 塗りの帯をやめ、月の色の点と縁取りだけの札に） */
+  .monthband{flex:0 1 auto;min-width:0;display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:6px 14px;border-radius:12px;color:#fff;
+    background:rgba(255,255,255,.07);border:1px solid var(--mh);}
+  .monthband .dot{width:10px;height:10px;border-radius:50%;background:var(--mh);box-shadow:0 0 0 3px color-mix(in srgb,var(--mh) 35%,transparent);}
+  .monthband .main{font-size:16px;font-weight:700;letter-spacing:.03em;}
+  .monthband .sub{font-size:12.5px;font-weight:500;color:#c3cadb;}
+  .monthband .closedtag{background:rgba(255,255,255,.12);color:#e6e9f2;border-radius:999px;padding:2px 10px;font-size:12px;font-weight:600;}
+  .topbar select{font-family:var(--font);font-size:15px;padding:6px 10px;border-radius:8px;border:none;min-width:220px;}
+  .topbar .sp{flex:1}
+  .topbar .env{font-size:12px;color:#aab3c8;}
+  .zoombtn{font-family:var(--font);font-size:14px;color:#fff;background:transparent;border:1px solid rgba(255,255,255,.6);
+    border-radius:8px;padding:5px 12px;margin-right:10px;cursor:pointer;white-space:nowrap;}
+  .zoombtn:hover{background:rgba(255,255,255,.12);}
+  .zoombtn.on{background:#fff;color:#2b3553;font-weight:700;}
+  main{flex:1;min-height:0;display:flex;flex-direction:row;gap:0;padding:10px 14px;overflow:hidden;}
+  /* ①と②の境界（ドラッグで左右に動かす。20260927 管理者） */
+  #splitter{flex:none;width:10px;cursor:col-resize;position:relative;}
+  #splitter::after{content:'';position:absolute;top:0;bottom:0;left:4px;width:2px;border-radius:2px;background:transparent;transition:background .15s;}
+  #splitter:hover::after,#splitter.drag::after{background:var(--accent);}
+  body.splitting{cursor:col-resize;user-select:none;}
+  #rightCol{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px;}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 14px;}
+  section h2{font-size:14px;margin:0 0 8px;color:var(--accent);font-weight:600;}
+  .hintl{font-size:12px;color:var(--muted);font-weight:400;margin-left:8px;}
+
+  /* ① members（左サイドバー・表形式。2026-08-30フィードバック=数を数えやすく） */
+  #memberSec{flex:none;width:340px;display:flex;flex-direction:column;min-height:0;}
+  .memcount{flex:none;font-size:12.5px;color:var(--muted);margin:0 0 6px;}
+  .memcount b{color:var(--ink);font-size:16px;margin-right:4px;}
+  .memtblwrap{flex:1;min-height:160px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:#fff;}
+  table.mem{width:100%;border-collapse:collapse;font-size:12.5px;}
+  table.mem td{border-bottom:1px solid #eef0f5;padding:3px 5px;vertical-align:middle;}
+  table.mem td.no{color:var(--muted);font-size:11px;text-align:right;width:26px;}
+  table.mem td.nm{font-weight:600;white-space:nowrap;}
+  table.mem td.ti{color:var(--muted);font-size:11px;white-space:nowrap;}
+  /* 勤務の区分（20260927 管理者: フルタイム／パートタイム／院外研修専従）。行の地と切り替えボタンの色で見分ける */
+  table.mem tr.w-part{background:#fdf3e3;}
+  table.mem tr.w-ingai{background:#eceffb;}
+  table.mem tr.grp td{background:#f1f4f9;color:#33405a;font-weight:600;font-size:11.5px;padding:5px 5px 3px;border-bottom:1px solid #d8deea;}
+  table.mem tr.grp.unk td{background:#fdf0e1;color:#9a4d00;}
+  table.mem td.sg select{font-size:11px;max-width:10em;padding:0 1px;}
+  .kubun{border:1px solid #b9c8ef;background:#fff;color:var(--accent);border-radius:999px;
+    font-size:10px;padding:1px 7px;cursor:pointer;white-space:nowrap;font-family:var(--font);}
+  .kubun.k-part{background:#c07b12;color:#fff;border-color:#c07b12;font-weight:600;}
+  .kubun.k-ingai{background:#5a6db5;color:#fff;border-color:#5a6db5;font-weight:600;}
+  #shozokuBanner .kubun{cursor:default;}
+  /* ①の帯: この名簿が Dr.JOY の所属医師の申告になる（常に見せる。20260927） */
+  .shzbanner{flex:none;margin:0 0 8px;padding:6px 9px;background:#fff8d6;border:1.5px solid #e6c34a;border-radius:8px;
+    font-size:11px;line-height:1.45;color:#5a4a10;}
+  .shzbanner .lead{font-weight:700;color:#7a5200;margin-bottom:4px;}
+  .shzbanner .defs{display:grid;grid-template-columns:auto 1fr;gap:3px 6px;align-items:start;margin-bottom:4px;}
+  .shzbanner .defs .kubun{text-align:center;}
+  .shzbanner .rmrule{color:#b3261e;font-weight:600;}
+  .shznote{flex:none;margin:0 0 8px;font-size:11.5px;color:var(--muted);}
+  /* 当直枠専用グループ（内科・集中治療室・管理当直・内科C 初期研）は診療科ではないことを目立たせる（20261105 管理者） */
+  /* 早見表（事務担当作 v-1.1。20261106 管理者: 診療科のときだけ目立つボタンで開く） */
+  .hayamibtn{flex:none;display:block;width:100%;margin:0 0 8px;padding:8px 10px;background:#d35400;color:#fff;border:none;border-radius:8px;
+    font-family:var(--font);font-size:13.5px;font-weight:700;cursor:pointer;box-shadow:0 2px 6px rgba(211,84,0,.35);}
+  .hayamibtn:hover{background:#b84a00;}
+  #hayamiOv .modal{max-width:min(1180px,96vw);max-height:92vh;padding:18px 20px;}
+  .hayami{border-collapse:collapse;width:100%;font-size:13px;line-height:1.55;}
+  .hayami th,.hayami td{border:1px solid #333;padding:5px 8px;vertical-align:middle;}
+  .hayami th{font-weight:700;text-align:center;background:#fff;}
+  .hayami th.app{background:#dbe8f7;font-size:15px;}
+  .hayami th.joy{background:#fbe3d6;font-size:15px;}
+  .hayami td.kind{font-weight:700;text-align:center;width:9.5em;white-space:nowrap;}
+  .hayami td.who{text-align:center;background:#dbe8f7;width:5.5em;}
+  .hayami td.whoj{background:#fbe3d6;width:16em;white-space:nowrap;}
+  .hayami td.set{text-align:center;}
+  .hayami td.nw{white-space:nowrap;}
+  .hayami td.gap,.hayami th.gap{border:none;background:none;width:14px;padding:0;}
+  .hayami .red{color:#c00000;}
+  .hayami .kubun{font-size:12px;padding:2px 10px;cursor:default;}
+  .hayami tr.ingai td:not(.gap){background-color:#eef5ea;}
+  .hayami tr.sp td{border:none;height:8px;padding:0;}
+  .hayamihd{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:8px;}
+  .hayamihd h3{margin:0;font-size:18px;color:#1f3fa8;}
+  .hayamihd .ver{font-size:11px;color:var(--muted);white-space:nowrap;}
+  .hayaminote{margin-top:8px;color:#c00000;font-weight:700;text-align:right;}
+  .grpbadge{flex:none;margin:0 0 8px;padding:6px 10px;background:#c62828;color:#fff;font-weight:700;font-size:13px;border-radius:8px;text-align:center;}
+  /* 提出の確認: Dr.JOY の所属医師の変化（20260927） */
+  .cfshz{margin-top:12px;padding:10px 12px;background:#fff8d6;border:1.5px solid #e6c34a;border-radius:8px;font-size:13px;line-height:1.6;}
+  .cfshz h4{margin:0 0 4px;font-size:14px;color:#7a5200;}
+  .cfshz .grp{margin-top:6px;font-weight:700;}
+  .cfshz .who{margin-left:1em;}
+  .cfshz .sub{color:var(--muted);font-size:11.5px;margin-left:4px;}
+  table.mem button.rm{border:none;background:none;color:var(--ng);cursor:pointer;font-size:20px;font-weight:700;line-height:1;padding:0;width:30px;text-align:center;}   /* 20261102 管理者: × が小さい・×と－の中心を揃える */
+  table.mem button.rm:disabled{color:#b4bac6;cursor:not-allowed;}
+  .cfkotai{margin-top:10px;max-height:42vh;overflow:auto;font-size:14px;line-height:1.7;}
+  .cfkotai .when{color:var(--muted);margin-right:6px;}
+  .cfkotai .arrow{color:var(--accent);font-weight:700;margin:0 6px;}
+  .kubun.locked{cursor:default;opacity:.75;}
+  .addbox{position:relative;display:block;flex:none;margin-top:8px;}
+  .addbox input{font-family:var(--font);font-size:13px;padding:5px 10px;border:1px solid var(--line);border-radius:999px;width:100%;box-sizing:border-box;}
+  .addlist{position:absolute;bottom:110%;left:0;z-index:30;background:#fff;border:1px solid var(--line);border-radius:8px;
+    box-shadow:0 6px 18px rgba(30,40,80,.18);max-height:260px;overflow:auto;min-width:300px;display:none;}
+  .addlist div{padding:5px 12px;cursor:pointer;white-space:nowrap;}
+  .addlist div:hover{background:var(--accent-soft);}
+  .addlist .sub{color:var(--muted);font-size:11px;margin-left:6px;}
+  .addlist div.unreg{border-top:1px dashed var(--line);color:var(--accent);font-weight:600;}
+  /* Dr.JOY未登録の手入力医師（20260902ユーザー決定）*/
+  .badge-un{display:inline-block;font-size:10px;font-weight:600;color:#fff;background:#8a5cc7;border-radius:4px;padding:0 5px;margin-left:4px;vertical-align:1px;}
+  #unregOv .fld{display:flex;align-items:center;gap:10px;margin:8px 0;}
+  #unregOv .fld label{width:5em;color:var(--muted);font-size:13px;}
+  #unregOv input,#unregOv select{font-family:var(--font);font-size:14px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;}
+  #unregOv input{width:16em;}
+  #unCands{margin-top:12px;padding:10px 12px;background:#fdf3e3;border:1px solid #e7c98f;border-radius:8px;}
+  #unCands .q{font-weight:700;color:var(--warn);margin-bottom:6px;}
+  #unCands .cand{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:13px;}
+  #unCands .cand .how{font-size:11px;color:var(--muted);}
+  #unCands .cand button{margin-left:auto;}
+
+  /* ② calendar（月曜はじまり。週=行・月〜日=列） */
+  #gridSec{flex:1;min-height:0;display:flex;flex-direction:column;}
+  #gridSec.dragover{outline:3px dashed #2a9d6f;outline-offset:-3px;background:#f2fbf6;}   /* xlsx をドラッグ中 */
+  .gridwrap{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:8px;}
+  table.cal{border-collapse:separate;border-spacing:0;font-size:12px;width:100%;table-layout:fixed;
+    min-width:760px;}  /* ノート PC（1920×1200・150%）で7日が収まる幅。拡大して狭くなったら、カレンダーの中だけ横にスクロール（氏名の欄を切らない。20260927） */
+  table.cal th,table.cal td{border-right:1px solid var(--line);border-bottom:1px solid var(--line);padding:0;vertical-align:top;background:#fff;}
+  table.cal thead th{position:sticky;top:0;z-index:5;background:#f4f6fb;text-align:center;font-weight:600;padding:4px 0;}
+  table.cal thead th.sat{color:var(--sat);background:#edf3fc;} table.cal thead th.sun{color:var(--sun);background:#fdefef;}
+  td.na{background:#f0f1f4;}
+  /* 週と週の区切りを濃く（20260902ユーザー指示「メリハリ」）。列の縦線は従来のまま */
+  table.cal tbody td{border-bottom:3px solid #8b94ad;}
+  /* 必須（ファースト帯）の未入力セレクトは薄赤で目立たせる（20260902・チェック③と同じ判定） */
+  .slot select.req-empty{background:#fdefef;border-color:#e6a3a3;}
+  .dayhead{display:flex;align-items:baseline;gap:5px;padding:3px 6px 1px;border-bottom:1px dashed #e4e7ef;}
+  .dayhead .dn{font-weight:700;font-size:13px;}
+  .dayhead.sat .dn{color:var(--sat);} .dayhead.hol .dn{color:var(--sun);}
+  .dayhead .hn{font-size:10px;color:var(--sun);}
+  .fblock{padding:2px 4px 3px;}
+  .fblock+.fblock{border-top:1px dotted #e8eaf1;}
+  /* バンドごとの入れ物（週の行内で高さを揃え、平日の夜ブロックを土日祝の夜と同じ高さに置く。
+     20260831ユーザー指示。minHeightはrenderGridの後処理が行ごとに設定する） */
+  .bb{min-height:0;}
+  .bbfilled+.bbfilled .fblock:first-child{box-shadow:0 -1px 0 #e8eaf1;}  /* 区切り線（高さに影響させない=行の高さ揃えを崩さない） */
+  .flabel{font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .flabel.fl-first{color:var(--accent);}
+  .toban{display:block;margin:-1px 0 2px;color:#d32f2f;font-weight:800;font-size:12px;letter-spacing:1px;line-height:1.2;}  /* 当番当直（20260922 管理者）: 赤字で目立たせる */
+  .flabel.fl-second{color:#0f766e;}
+  /* バッジ（バンド）はラベルの先頭に置く（20260831ユーザー指示「夜 ファースト」の語順） */
+  .flabel .shape{display:inline-block;font-size:10px;font-weight:600;border-radius:4px;padding:0 5px;margin-right:4px;color:#fff;vertical-align:1px;}
+  .shape.s昼{background:#c07b12;} .shape.s夜{background:#5a6db5;}
+  .shape.s全日,.shape.s昼夜{background:#3f9d7a;}
+  .slot{display:flex;align-items:center;gap:2px;margin:1px 0;}
+  .slot select{font-family:var(--font);font-size:12px;flex:1;min-width:0;border:1px solid var(--line);border-radius:5px;padding:1px 2px;background:#fff;}
+  .slot select.filled{background:var(--accent-soft);border-color:#b9c8ef;}
+  /* 決裁のときから変わったところ（決裁後の交代申請。20260924 管理者）: 名前は赤字、取り止めで空いた欄は赤枠 */
+  .slot select.chg{color:#d32f2f;font-weight:700;border-color:#e57373;background:#fdecec;}
+  .slot select.chg-empty{border:2px solid #e57373;}
+  /* たった今変えた＝まだ提出していない欄（20260924 管理者）: 黄色の地＋橙の枠。赤字（決裁から変わった）とは重ねて出る */
+  .slot select.pend{background:#fff3c4;box-shadow:0 0 0 2px #f59e0b;}
+  .slot select.pend-empty{box-shadow:0 0 0 2px #f59e0b;background:#fffbe6;}
+  /* 当番当直の欄（20260925 管理者）: DTX14・当直表xlsx と同じグレー地に白字（#595959 = sheet_style.C_TOBAN_BG）。
+     決裁から変わった欄は赤字ではなく赤の2px枠、たった今変えた欄は橙の影だけ（黄色の地は出さない）。
+     ⚠ 上の .filled/.req-empty/.chg/.pend と同じ詳細度なので、必ずこの後ろに置く（後勝ちで灰地・白字にする） */
+  .slot select.tb{background:#595959;color:#fff;font-weight:700;border-color:#595959;}
+  .slot select.tb option{background:#fff;color:#000;font-weight:400;}
+  .slot select.tb.chg{color:#fff;background:#c00000;border-color:#c00000;}  /* 当番当直の交代は赤地に白字（20260929） */
+  .slot select.tb.chg-empty{border:2px solid #ef5350;}
+  .slot select.tb.pend,.slot select.tb.pend-empty{background:#595959;}
+  /* 同じ人が同じマスに2回（20260926: 提出できない）。ほかの印と重ならないよう outline で赤く囲む */
+  .slot select.xdept{outline:2px dashed #7b3fb3;outline-offset:2px;}  /* ほかの所属の医師（応援）。20261031。同じ人2回（dup）を優先 */
+  .slot select.dup{outline:2px solid var(--ng);outline-offset:1px;}
+  .slot .tg{flex:none;border:1px solid var(--line);border-radius:5px;cursor:pointer;font-size:11px;padding:1px 5px;font-weight:700;}
+  .slot .tg.duty{background:var(--accent-soft);color:var(--accent);border-color:#b9c8ef;}
+  .slot .tg.oc{background:#fdf3e3;color:var(--warn);border-color:#e7c98f;}
+  .addoc{border:1px dashed var(--line);background:#fff;color:var(--muted);border-radius:5px;cursor:pointer;font-size:10px;padding:0 5px;margin-top:1px;}
+  .addoc:hover{background:#fdf3e3;color:var(--warn);}
+
+  /* 折りたたみ式の説明文（20260831ユーザー指示。既定=閉。クリックで開閉） */
+  details.hintd{display:inline-block;font-size:12px;color:var(--muted);font-weight:400;margin-left:8px;vertical-align:baseline;}
+  details.hintd summary{display:inline;cursor:pointer;color:var(--accent);font-weight:600;font-size:12px;user-select:none;list-style:none;}
+  details.hintd summary::-webkit-details-marker{display:none;}
+  details.hintd summary::after{content:' ▸';font-size:11px;}
+  details.hintd[open] summary::after{content:' ▾';}
+  details.hintd .hintbody{display:block;margin:4px 0 2px;padding:6px 10px;background:#f4f6fb;border:1px solid var(--line);border-radius:8px;line-height:1.55;}
+  details.hintd:not([open]) .hintbody{display:none;}  /* UA差の保険: 閉じているとき必ず隠す */
+  details.hintd[open]{display:block;margin:2px 0 0;}  /* 開いたら本文を見出しの下に全幅で出す */
+  /* ①の説明を開いたときや文字を大きくしたときは、①の欄ごと縦にスクロール（下が切れて読めなかった。20260927）。
+     名簿の表は最低 160px を残し、そこから先は欄のスクロールで見る */
+  #memberSec{overflow-y:auto;}
+
+  /* 昼夜共通スイッチ（20260831ユーザー決定「目立つように」）*/
+  .sharebar{flex:none;display:none;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 8px;
+    padding:7px 12px;background:#eefaf4;border:1.5px solid #9fd8bf;border-radius:10px;}
+  .shcap{font-size:12.5px;font-weight:700;color:#1f6b4d;white-space:nowrap;}
+  .shsw{display:inline-flex;align-items:center;gap:8px;border:2px solid #c9ced9;border-radius:999px;
+    padding:4px 14px 4px 6px;cursor:pointer;font-family:var(--font);font-size:13px;font-weight:700;
+    background:#fff;color:#5a6272;}
+  .shsw .knob{width:34px;height:18px;border-radius:999px;background:#c9ced9;position:relative;flex:none;transition:background .15s;}
+  .shsw .knob::after{content:'';position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:left .15s;box-shadow:0 1px 2px rgba(0,0,0,.25);}
+  .shsw.on{background:#1f9d6b;border-color:#1f9d6b;color:#fff;}
+  .shsw.on .knob{background:rgba(255,255,255,.35);}
+  .shsw.on .knob::after{left:18px;}
+  .shsw:hover{filter:brightness(1.05);}
+  .gridbar{flex:none;display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;}
+  .btn{font-family:var(--font);font-size:13px;padding:7px 14px;border:1px solid var(--line);border-radius:8px;background:#fff;cursor:pointer;}
+  .btn:hover{background:var(--accent-soft);}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;font-size:14px;padding:8px 22px;}
+  .btn.primary:disabled{background:#b8bdcf;border-color:#b8bdcf;cursor:not-allowed;}
+
+  /* checks（第17版で③パネル廃止。第18版で日付マーク・ホバー吹き出しも廃止=未入力は選択ボックスの薄赤だけ・件数はフッター） */
+  .msg{margin:2px 0;font-size:12.5px;}
+  /* 土日祝のマス全体を見出しと同系統の色で薄く（見出しの色味の約1/3・20260902ユーザー指示） */
+  table.cal td.sat{background:#f7fafe;} table.cal td.hol{background:#fef8f8;}
+  .msg.err{color:var(--ng);} .msg.warn{color:var(--warn);} .msg.ok{color:var(--ok);}
+  footer{flex:none;display:flex;align-items:center;gap:12px;padding:8px 16px;background:var(--panel);border-top:1px solid var(--line);position:relative;}
+  footer .sp{flex:1}
+  /* 未提出の変更があるあいだ、提出ボタンの真上で赤い矢印が点滅する（20260922 管理者指示） */
+  /* 未提出の変更があるあいだ、提出ボタンの真上で赤い矢印が2本、弾むように動く（20260922 管理者指示・20260925 2本・小さめ・低め） */
+  #dirtyArrow{display:none;position:absolute;right:16px;bottom:calc(100% - 4px);width:200px;pointer-events:none;
+    filter:drop-shadow(0 2px 3px rgba(120,20,20,.35));}
+  /* 矢印は提出ボタンの真上（幅と右端をボタンに合わせる＝placeArrow。20260925） */
+  footer.dirty #dirtyArrow{display:flex;justify-content:center;gap:12px;}
+  #dirtyArrow svg{display:block;width:45px;height:54px;animation:dirtyBounce 1s ease-in-out infinite;}
+  #dirtyArrow svg:nth-child(2){animation-delay:.15s;}
+  @keyframes dirtyBounce{0%,100%{transform:translateY(-5px);opacity:1}50%{transform:translateY(3px);opacity:.6}}
+  footer label{font-size:12px;color:var(--muted);display:inline-flex;gap:5px;align-items:center;}
+
+  /* import result */
+  .overlay{position:fixed;inset:0;background:rgba(40,48,70,.45);display:none;align-items:center;justify-content:center;z-index:50;}
+  .modal{background:#fff;border-radius:14px;max-width:760px;max-height:80vh;overflow:auto;padding:22px 26px;box-shadow:0 12px 40px rgba(20,30,60,.35);}
+  .modal h3{margin:0 0 10px;font-size:16px;}
+  .modal .rej{color:var(--ng);font-size:12.5px;margin:3px 0;}
+  .modal .accepted{color:var(--ok);font-size:13px;margin:8px 0;}
+  /* 違う月の Excel を書き出したあとに、その月の予定が変わっていた（20260925） */
+  .stalebox{margin:6px 0 10px;padding:10px 12px;background:#fdecec;border:1.5px solid #e57373;border-radius:8px;font-size:13px;line-height:1.6;}
+  .stalebox .q{font-weight:700;color:#c62828;margin-bottom:4px;}
+  .stalebox .staleok{display:flex;align-items:center;gap:6px;margin-top:6px;font-weight:600;cursor:pointer;}
+  .modal .btns{display:flex;gap:10px;justify-content:flex-end;margin-top:16px;}
+  .confirm-q{font-size:17px;font-weight:600;line-height:1.6;}
+  .confirm-q b{color:var(--accent);}
+  .donebox{text-align:center;padding:10px 30px;}
+  .donebox .ck{font-size:44px;color:var(--ok);}
+  #loaderr{margin:16px;padding:16px;border-radius:10px;background:#fdefef;color:var(--ng);display:none;}
+</style>
+</head>
+<body>
+<script id="cfgdata" type="application/json">__CONFIG_JSON__</script>
+
+<div class="topbar">
+  <h1 id="title">当直勤務表</h1>
+  <div class="dl" id="deadline"></div>
+  <select id="deptSel"><option value="">科を選んでください</option></select>
+  <div class="sp"></div>
+  <button class="zoombtn" id="zoomBtn" title="画面全体を1.5倍にします（もう一度押すと元に戻ります）。
+Ctrl を押しながらマウスのホイールでも大きさを変えられます（Ctrl＋0 で元の大きさ）">文字を大きく</button>
+  <div class="env" id="envNote"></div>
+<div class="monthband" id="monthBand"></div>
+</div>
+<div id="loaderr"></div>
+<main id="main" style="display:none">
+  <section id="memberSec">
+    <h2>① <span class="tgtMonth"></span><span id="memHeadName">貴科リスト</span><span id="memHeadSuffix"></span><details class="hintd"><summary>この名簿について</summary><span class="hintbody"><span id="helpShozoku"><b>■ この名簿の役割</b><br>・この名簿がそのまま、Dr.JOY の「所属医師」の申告になります。<br><span style="color:#c00000">（Dr.JOY スタッフアップデート表は廃止です。）</span><br>・区分の切り替え、医師の追加と削除、Dr.JOY への反映は、オレンジの「早見表を見る」ボタンで見られます。<br><b>■ 前の月からの引き継ぎ</b><br>・まだ提出していない月は、前の月に出した名簿と区分を引き継いで表示します。<br>・初期研はローテーション計画が入っています。実際と違う場合は、修正してください。<br></span><b>■ 検索で見つからない医師</b><br><span class="grpOnly" style="display:none">・下の検索欄に氏名を入れて「手入力で追加」を押すと、手で入れられます。<br></span>・手で入れた医師には <span class="badge-un">手入力</span> の印が付きます。そのままで大丈夫です（Dr.JOY への登録は事務担当がします）。<br><b>■ <span class="badge-un" style="background:#c62828">退職・異動？</span> の印</b><br>・Dr.JOY から外れた医師です（退職・異動など）。<br>・<span class="kikaOnly">この月に貴科にいなければ × で外してください。まだ貴科にいる医師なら、事務担当に知らせてください。</span><span class="grpOnly" style="display:none">この月にこの当直に入らなければ × で外してください。まだ当直に入る医師なら、事務担当に知らせてください。</span><br><span style="color:#c62828;font-weight:600">・Dr.JOY に登録されていない場合、宿日直手当などの手当は出ません。</span></span></details></h2>
+    <button id="hayamiBtn" class="hayamibtn" style="display:none" title="区分の切り替え・医師の追加と削除で、診療科がやることと Dr.JOY への反映">早見表を見る（診療科がやること・Dr.JOY への反映）</button>
+    <div id="grpBadge" class="grpbadge" style="display:none">当直枠専用グループ（診療科ではありません）</div>
+    <div id="shozokuBanner" style="display:none"></div>
+    <div class="memcount" id="memCount"></div>
+    <div class="memtblwrap"><table class="mem"><tbody id="memTbl"></tbody></table></div>
+    <div class="addbox">
+      <input id="addInput" type="text" placeholder="＋ 医師を追加（氏名・かな・ローマ字で検索）" autocomplete="off">
+      <div class="addlist" id="addList"></div>
+    </div>
+  </section>
+  <div id="splitter" title="ドラッグで左右の幅を変えられます（ダブルクリックで元の幅に）"></div>
+  <div id="rightCol">
+  <section id="gridSec">
+    <h2>② <span class="tgtMonth"></span>当直の割当<details class="hintd"><summary>使い方</summary><span class="hintbody"><b>■ 入力のしかた</b><br>・「当」は当直で、院内に常駐します。「オ」はオンコールで、呼ばれたときだけ来ます。手当計算に関わりますので、正確に入力してください<br>・セカンド以下の枠は「追加」でもう1人足せます<br><b>■ 休日の昼と夜</b><br>・昼と夜、同じ人の場合は、「昼夜共通」をONにします。1回の入力が昼と夜の両方に保存されます<br>・昼と夜で人が替わる枠はOFFにして、別々に入力してください<br><b>■ 提出</b><br>・ファーストの枠は、空欄だと提出できません。未入力は薄赤で表示されます<br>・「△ 警告」は注意だけです。連続当直などで出ますが、そのままでも提出できます<br>・Excelで作るときは「Excelに書き出す」→ 記入 →「Excelから取り込む」</span></details></h2>
+    <div class="sharebar" id="shareBar"></div>
+    <div class="gridwrap" id="gridwrap"></div>
+    <div class="gridbar">
+      <button class="btn" id="tplDlBtn">📄 Excelに書き出す</button>
+      <button class="btn" id="importBtn" title="当直表の xlsx をこの欄へドラッグ＆ドロップしても取り込めます">📥 Excelから取り込む（ドラッグでも可）</button>
+      <span class="hintl" id="importNote"></span>
+    </div>
+  </section>
+  </div>
+</main>
+<footer id="footer" style="display:none">
+  <div class="sp"></div>
+  <div class="msg" id="chkSummary"></div>
+  <div class="msg err" id="footErr"></div>
+  <button class="btn primary" id="submitBtn" disabled>この内容で提出する</button>
+  <div id="dirtyArrow" aria-hidden="true" title="まだ提出されていません（黄色の欄）">
+    <svg viewBox="0 0 40 48"><defs><linearGradient id="dag1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff8a65"/><stop offset="1" stop-color="#d32f2f"/></linearGradient></defs><path d="M20 46 L3 26 H13 V5 a3 3 0 0 1 3-3 H24 a3 3 0 0 1 3 3 V26 H37 Z" fill="url(#dag1)" stroke="#fff" stroke-width="2.5" stroke-linejoin="round"/></svg><svg viewBox="0 0 40 48"><defs><linearGradient id="dag2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff8a65"/><stop offset="1" stop-color="#d32f2f"/></linearGradient></defs><path d="M20 46 L3 26 H13 V5 a3 3 0 0 1 3-3 H24 a3 3 0 0 1 3 3 V26 H37 Z" fill="url(#dag2)" stroke="#fff" stroke-width="2.5" stroke-linejoin="round"/></svg></div>
+</footer>
+
+<div class="overlay" id="ymOv">
+  <div class="modal">
+    <h3>Excelに書き出す</h3>
+    <div class="msg">どの月の当直表を書き出しますか？</div>
+    <div style="margin:10px 0"><select id="ymSel" style="font-size:15px;padding:6px"></select></div>
+    <div class="msg" style="color:var(--muted)">すでに決まっている月は名前入り、これからの月は空白で出ます。</div>
+    <div class="btns">
+      <button class="btn" id="ymNo">やめる</button>
+      <button class="btn primary" id="ymYes">書き出す</button>
+    </div>
+  </div>
+</div>
+<div class="overlay" id="importOv">
+  <div class="modal">
+    <h3>取込結果</h3>
+    <div class="accepted" id="impOk"></div>
+    <div id="impRejs"></div>
+    <div class="btns">
+      <button class="btn" id="impCancel">やめる</button>
+      <button class="btn primary" id="impApply">カレンダーに入れる</button>
+    </div>
+  </div>
+</div>
+<div class="overlay" id="confirmOv">
+  <div class="modal">
+    <div class="confirm-q"><b id="cfDept">—</b> の R<span id="cfYm"></span> の当直表を提出します。</div>
+    <div class="msg" id="cfSub" style="color:var(--muted);margin-top:8px;"></div>
+    <div id="cfKotai" class="cfkotai" style="display:none"></div>
+    <div id="cfShozoku" class="cfshz" style="display:none"></div>
+    <div class="btns">
+      <button class="btn" id="cfNo">いいえ・戻る</button>
+      <button class="btn primary" id="cfYes">はい、提出します</button>
+    </div>
+  </div>
+</div>
+<div class="overlay" id="hayamiOv">
+  <div class="modal">
+    <div id="hayamiCap" style="background:#fff;padding:10px 14px">
+    <div class="hayamihd"><h3>当直表アプリ「①貴科リスト ＝「Dr.JOY所属」の申告」早見表</h3><span class="ver">v-1.1</span></div>
+    <table class="hayami">
+      <tr><th class="app" colspan="4">当直表アプリ</th><th class="gap"></th><th class="joy" colspan="2">Dr.JOY</th></tr>
+      <tr><th>変更内容</th><th>所属医師の勤務状況</th><th>設定内容</th><th class="app" style="font-size:13px">設定担当</th><th class="gap"></th><th>入力内容</th><th class="joy" style="font-size:13px">入力担当</th></tr>
+      <tr><td class="kind" rowspan="5">貴科所属医師の<br>勤務区分<span class="red">更新</span></td>
+        <td>平日の毎日が病院勤務</td><td class="set" rowspan="3"><span class="kubun">フルタイム</span></td><td class="who" rowspan="3">診療科</td><td class="gap"></td>
+        <td class="nw">月～金の 8:30～17:15 の<br>勤務予定</td><td class="whoj">事務部（来月分は自動入力）<br><span class="red">診療科（月に入ってからの変更分）</span></td></tr>
+      <tr><td>産休・育休・病休</td><td class="gap"></td><td>休暇申請</td><td class="whoj">診療科</td></tr>
+      <tr><td>年休・代休</td><td class="gap"></td><td>休暇申請</td><td class="whoj">診療科</td></tr>
+      <tr><td class="nw">当直、外来など一部だけの病院勤務医師<br>- 大学院生で外来・当直だけに来る<br>- 院外研修中で外来・当直だけに来る<br>- 他院から当直だけに来る</td>
+        <td class="set"><span class="kubun k-part">パートタイム</span></td><td class="who">診療科</td><td class="gap"></td><td class="nw">勤務する日があるときの<br>勤務予定</td><td class="whoj">診療科</td></tr>
+      <tr class="ingai"><td class="nw">院外研修中で、当院の仕事は<br>していない<b>専攻医</b></td><td class="set"><span class="kubun k-ingai">院外研修専従</span></td><td class="who">診療科</td><td class="gap"></td>
+        <td>「勤務なし（院外研修中）」</td><td class="whoj">事務部（来月分は自動入力）<br><span class="red">診療科（月に入ってからの変更分）</span></td></tr>
+      <tr class="sp"><td colspan="7"></td></tr>
+      <tr><td class="kind">貴科所属医師の<br><span class="red">追加</span></td><td>着任、他科から移籍、留学戻り</td>
+        <td class="nw">「貴科リスト」下部の「＋ 医師を追加」欄に<br>氏名を入れる。<br>検索されたら選び、<br>出ない場合は「手入力で追加」を押す。</td><td class="who">診療科</td><td class="gap"></td>
+        <td class="nw">Dr.JOY グループへ追加</td><td class="whoj">事務部</td></tr>
+      <tr class="sp"><td colspan="7"></td></tr>
+      <tr><td class="kind">いなくなった医師の<br><span class="red">削除</span></td><td class="nw">転出、他科へ移籍、留学、<br>研究だけの大学院生</td>
+        <td class="set">「<span class="red" style="font-weight:700">×</span>」で外す。</td><td class="who">診療科</td><td class="gap"></td>
+        <td class="nw">Dr.JOY グループから削除</td><td class="whoj">事務部</td></tr>
+    </table>
+    <div class="hayaminote">※ 当直表：当日14時30分までの交代申請は、Dr.JOY に自動反映されます。</div>
+    </div>
+    <div class="btns"><span id="hayamiMsg" style="align-self:center;font-size:12.5px;color:var(--muted)"></span><button class="btn" id="hayamiSave" style="display:none">画像として保存</button><button class="btn primary" id="hayamiClose">閉じる</button></div>
+  </div>
+</div>
+<div class="overlay" id="unregOv">
+  <div class="modal">
+    <h3>検索で見つからない医師を手で追加</h3>
+    <div class="msg" style="color:var(--muted)">Dr.JOYの名簿にまだない医師を当直表に載せるための手入力です。Dr.JOYに登録されたら、集約のときに氏名で本人に結び付けます。</div>
+    <div class="fld"><label>氏名</label><input id="unName" placeholder="姓 名（間に空白）"></div>
+    <div class="fld"><label>職名</label><select id="unTitle"><option value="医師">医師（教員）</option><option value="大学院生">大学院生</option><option value="専攻医">専攻医</option><option value="初期研">初期研</option><option value="">その他</option></select></div>
+    <div id="unCands" style="display:none"></div>
+    <div class="msg err" id="unErr"></div>
+    <div class="btns">
+      <button class="btn" id="unCancel">やめる</button>
+      <button class="btn primary" id="unAdd">追加する</button>
+    </div>
+  </div>
+</div>
+<div class="overlay" id="doneOv">
+  <div class="modal donebox">
+    <div class="ck">✓</div>
+    <h3 id="doneMsg">提出が完了しました</h3>
+    <div class="msg" id="doneSub" style="color:var(--muted)"></div>
+    <div class="btns" style="justify-content:center">
+      <button class="btn" id="doneClose">閉じる（修正して再提出もできます）</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(async function(){
+"use strict";
+const $=(s,el)=>(el||document).querySelector(s);
+const IS_APP=!!window.td;
+
+// ---- 氏名の正規化（tools/contract.py と同じ規則: 空白除去 → NFC → 異体字を寄せる）----
+const ITAIJI={"髙":"高","﨑":"崎","桒":"桑","濵":"浜","栁":"柳","德":"徳","眞":"真","淺":"浅",
+  "靑":"青","賴":"頼","曻":"昇","硏":"研","瀨":"瀬","圡":"土"};
+const namekey=s=>String(s||"").replace(/[ 　]/g,"");
+const nfc=s=>String(s||"").normalize("NFC");
+const canon=s=>nfc(namekey(s)).replace(/./g,c=>ITAIJI[c]||c);
+
+// ---- 画面に依らない小さな判定（20260926）----
+//   tools/test_app_lib.mjs が node で「@pure-begin」〜「@pure-end」の区間だけを読んで確かめる。
+//   ⚠ この区間の中では DOM・cfg・ほかの関数に触らない（引数だけで決める）
+// @pure-begin
+// 貴科の医師リストを直せるか（20261028 管理者: × と区分の切り替えは部門管理者だけ。app/lib/rights.cjs と同じ規則）。
+//   editor = roster_editors.json の1人（{level:'全体'|'所属', depts:[...]}・管理者でなければ null）
+// その提出単位の部門管理者か（全体管理者・追加の作成者＝owners に名指し・所属管理者。20261028）
+function canEditR(owner,editor,deptMap){
+  if(!editor) return false;
+  if(editor.level==='全体') return true;
+  if((editor.owners||[]).includes(owner)) return true;
+  if(editor.level!=='所属') return false;
+  const e=(deptMap||{})[owner];
+  const pats=Array.isArray(e)?e:((e&&Array.isArray(e.dept))?e.dept:[]);
+  const segs=d=>String(d||'').split(/[/／、]/).map(x=>x.trim()).filter(Boolean);
+  return (editor.depts||[]).some(d=>segs(d).some(x=>pats.some(p=>p&&x.includes(p))));
+}
+function canEditRosterR(owner,editor,ownersDef,deptMap){
+  if(!(ownersDef||[]).includes(owner)) return true;            // 所属の申告にならない提出単位は制限しない
+  return canEditR(owner,editor,deptMap);
+}
+// 同じマス（枠×日×昼夜）に同じ人が2回以上入っているもの → [{ck:'枠|日|昼夜', login}]（1マス1人につき1件）
+function dupInCells(grid){
+  const seen=new Set(), told=new Set(), out=[];
+  for(const [k,v] of grid){
+    if(!v||!v.login) continue;
+    const ck=String(k).split('|').slice(0,3).join('|'), id=ck+'|'+v.login;
+    if(!seen.has(id)){ seen.add(id); continue; }
+    if(!told.has(id)){ told.add(id); out.push({ck,login:v.login}); }
+  }
+  return out;
+}
+// この枠×日×昼夜は空のまま出せないか: ファースト帯（f-*・直近実績あり）か、当番当直の欄（isTobanFn）
+function isRequiredBand(f,date,band,isTobanFn){
+  return (String(f.frame_id||'').startsWith('f-')&&f.used_2026_09>0)||!!(isTobanFn&&isTobanFn(f,date,band));
+}
+// Excel に書き出すときヘルパーに渡す下書き。対象月でない月は duties を付けない
+//   （空の配列を渡すと、その月の共有の予定ではなく空白の当直表になっていた。付けなければヘルパーが共有の予定を使う）
+//   20261009: 対象月でない月は roster（画面＝対象月の名簿）も付けない。ヘルパーがその月の予定の名簿を使う
+//   （対象月の名簿に居ない人の当直が表から黙って消え、その Excel を取り込むとその月の予定からも消えていた）
+function makeDraft(owner,year,month,roster,sameMonth,dutiesFn){
+  const d={schema:'hospital.duty-draft/1',owner,year,month};
+  if(sameMonth){ d.roster=roster; d.duties=dutiesFn(); }
+  return d;
+}
+// 違う月の Excel の取込: ヘルパーは職員コードを対象月の名簿（config）から引くので、対象月の名簿に居ない人は空になる。
+//   その月の予定（名簿と割当）から埋める（20261009）
+function fillCodesFrom(duties,ent){
+  const code=new Map();
+  for(const p of (ent&&ent.roster)||[]) if(p&&p.login&&p.code) code.set(p.login,p.code);
+  for(const r of (ent&&ent.duties)||[])
+    if(r&&r.staff_login&&r.staff_code&&!code.has(r.staff_login)) code.set(r.staff_login,r.staff_code);
+  return (duties||[]).map(r=>(r&&!r.staff_code&&code.has(r.staff_login))?{...r,staff_code:code.get(r.staff_login)}:r);
+}
+// 取込の注意（ヘルパーの warnings[]: {line,date,band,frame_id,name,why}）→ 取込結果に出す1行
+//   why にもう日付が書いてあれば（ヘルパーの文は「11月3日（火） 昼: …」の形）、日付と昼夜を重ねて付けない
+function importWarnText(w){
+  w=w||{};
+  const why=String(w.why||'');
+  const m=String(w.date||'').match(/^\d{4}-(\d\d)-(\d\d)/);
+  const md=m?`${+m[1]}月${+m[2]}日`:String(w.date||'');
+  const when=(md&&why.includes(md))?'':(md+(w.band?` 〔${w.band}〕`:'')).trim();
+  const who=w.name?`（${String(w.name).replace(/[ 　]/g,'')}）`:'';
+  return '△ '+(w.line?`${w.line}行目: `:'')+(when?when+': ':'')+(why||'確かめてください')+who;
+}
+// 決裁の状態（マスターの confirmed）が画面の前提から変わったか → 'confirmed'（決裁された）/'unconfirmed'（取り消された）/null
+function confirmChange(before,after){
+  const a=!!before, b=!!after;
+  return a===b?null:(b?'confirmed':'unconfirmed');
+}
+// td.loadMaster の結果から、その月の confirmed を取り出す（main が返す confirmed。無ければマスター自身の confirmed）
+function confirmedOf(mr){
+  if(!mr) return null;
+  if(mr.confirmed!==undefined) return mr.confirmed||null;
+  return (mr.master&&mr.master.confirmed)||null;
+}
+// ---- 名簿 = Dr.JOY の所属医師の申告（管理者 20260927）----
+// 職位ランク（医師(教員)=0 → 大学院生=1 → 専攻医=2 → 初期研=3 → その他=4）。職名の部分一致
+function rankOf(t){
+  t=t||'';
+  if(t.includes('初期研')||t.includes('初期研修')) return 3;
+  if(t.includes('専攻医')||t.includes('専門研修医')) return 2;
+  if(t.includes('大学院生')) return 1;
+  if(t.includes('医師')||t.includes('病院長')||t.includes('指定医')) return 0;
+  return 4;
+}
+// 職位の1文字（教/研/専/初/空）。dept_map の rank 条件と shozoku.exclude_ranks に使う
+function rankCode(t){ return ['教','研','専','初',''][rankOf(t)]; }
+// 勤務の区分: full=フルタイム／part=パートタイム／ingai=院外研修専従。
+//   work の無い古い名簿は in_house で読む（false=「当直のみ」→ パートタイム、それ以外 → フルタイム）
+const WORKS=['full','part','ingai'];
+function normWork(e){
+  e=e||{};
+  if(WORKS.includes(e.work)) return e.work;
+  return e.in_house===false?'part':'full';
+}
+function nextWork(w){ return WORKS[(WORKS.indexOf(normWork({work:w}))+1)%WORKS.length]; }
+// 保存する名簿の1行。in_house は従来の読み手（集約・手当計算）のために work から作る（フルタイムだけ true）
+//   seg = 集合当直で庶務が選んだ「Dr.JOY所属」（Dr.JOY の所属と違うときだけ。20261031 コードレビュー③）
+function rosterEntryOf(p,work,seg){
+  p=p||{}; const w=normWork({work});
+  return {login:p.login,code:p.code,name:p.name,title:p.title,in_house:w==='full',work:w,
+    ...(p.unregistered?{unregistered:true}:{}),...(seg?{seg}:{})};
+}
+// 所属（'/循環器内科/集中治療部/'）の区切り。空なら「所属未分類」とみなす
+function deptSegs(dept){
+  // 区切りは Python（shozoku.segments）・rights.cjs と同じ / ／ 、（20261031 コードレビュー）
+  const s=String(dept||'').split(/[\/／、]/).map(x=>x.trim()).filter(Boolean);
+  return s.length?s:['所属未分類'];
+}
+// dept_map の1項目 → 所属パターン
+function entryPats(entry){ return Array.isArray(entry)?entry:((entry&&Array.isArray(entry.dept))?entry.dept:[]); }
+// 集合当直（所属パターンが2つ以上の提出単位。内科 消化器・呼吸器など）の「貴科リスト」の行の「Dr.JOY所属」
+//   （20261031 コードレビュー③。tools/shozoku.member_seg と同じ規則）:
+//   選んだもの（seg）→ 無ければ Dr.JOY の所属で当たるパターン → 無ければ null。パターンが1つ以下の科は null
+function memberSegR(seg,dept,pats){
+  pats=pats||[];
+  if(pats.length<2) return null;
+  if(seg&&pats.includes(seg)) return seg;
+  const s=deptSegs(dept);
+  return pats.find(t=>t&&s.some(x=>x.includes(t)))||null;
+}
+// 「内科(消化器)」→「消化器」（集合当直の名簿で選ぶ欄の短い名前）
+function segShort(p){ const m=String(p||'').match(/[（(]([^（）()]+)[）)]\s*$/); return m?m[1]:String(p||''); }
+// 提出単位の名前に添える「Dr.JOY所属」（20261031 コードレビュー④）。名前が同じ科（麻酔科・循環器内科など）は ''
+function drjoyNote(owner,pats){
+  pats=(pats||[]).filter(Boolean);
+  if(!pats.length) return '';
+  const n=s=>String(s||'').replace(/[\s()（）]/g,'');
+  if(pats.length===1&&n(pats[0])===n(owner)) return '';
+  return pats.join('・');
+}
+// セカンドの枠（集合当直の中の1科の枠）にこの医師を入れると「他の所属」か（20261031 コードレビュー⑤）。
+//   framePats = その枠の科の所属パターン（枠の dept の dept_map）、seg = memberSegR の結果。分からなければ false（注意しない）
+function isCrossDept(seg,framePats){ return !!(seg&&framePats&&framePats.length&&!framePats.includes(seg)); }
+// dept_map の1項目（所属パターンの配列、または {dept:[...], rank:["初"]}）にこの人が当てはまるか。
+//   所属が2つある人は、どちらかが当てはまればよい（defaultMembers と同じ規則）
+function matchesDeptEntry(entry,p){
+  if(!entry||!p) return false;
+  const pats=Array.isArray(entry)?entry:(entry.dept||[]), ranks=Array.isArray(entry)?[]:(entry.rank||[]);
+  const segs=deptSegs(p.dept);
+  return pats.some(t=>t&&segs.some(s=>s.includes(t)))&&(!ranks.length||ranks.includes(rankCode(p.title)));
+}
+// 当直をしない部署（リハビリテーション部・病理診断科など）の医師か
+function isNonDutyDept(dept,nonDuty){
+  return deptSegs(dept).some(s=>(nonDuty||[]).some(t=>t&&s.includes(t)));
+}
+// config.shozoku（無い古い config は既定値。owners が無ければ、外す4つ以外の提出単位すべて）
+const SHOZOKU_DEFAULT={exclude_owners:['集中治療室','内科','管理当直','内科C 初期研'],
+  non_duty_depts:['リハビリテーション部','病理診断科','医療安全','研修管理室','所属未分類'],exclude_ranks:['初']};
+function shozokuSpec(sh,activeOwners){
+  sh=sh||{};
+  const ex=Array.isArray(sh.exclude_owners)?sh.exclude_owners:SHOZOKU_DEFAULT.exclude_owners;
+  const owners=Array.isArray(sh.owners)?sh.owners.slice()
+    :(activeOwners||[]).filter(o=>o&&o!=='管理者'&&!ex.includes(o));
+  return {owners,exclude_owners:ex,
+    non_duty_depts:Array.isArray(sh.non_duty_depts)?sh.non_duty_depts:SHOZOKU_DEFAULT.non_duty_depts,
+    exclude_ranks:Array.isArray(sh.exclude_ranks)?sh.exclude_ranks:SHOZOKU_DEFAULT.exclude_ranks};
+}
+const isUnregEntry=e=>!!(e&&(e.unregistered||String(e.login||'').startsWith('unreg:')));
+// まだ提出していない月の初期の名簿（前月からの引き継ぎ）。
+//   defaults = 対象月の Dr.JOY の所属で当てはまる人（defaultMembers）。
+//   prevRoster = 前月に同じ科が出した名簿（無ければ null）。people = 対象月の名簿（login → 人）。
+//   引き継ぐのは (a) 名簿外 (b) 対象月の所属が当直をしない部署か、まだこの科に当てはまる人。
+//   初期研（exclude_ranks）はローテーションに従うので引き継がない。対象月にほかの当直の科へ移った人も引き継がない。
+//   区分は前月の名簿にあればそれを使う（defaults の人も）。
+//   返り値 = {members:[login], work:{login:work}, seg:{login:選んだ「Dr.JOY所属」}, carried:[前月の名簿の行（名簿外の人を画面に足すのに使う）]}
+function carryOverMembers(o){
+  const members=(o.defaults||[]).slice(), work={}, seg={}, carried=[];
+  const prev=Array.isArray(o.prevRoster)?o.prevRoster:[];
+  const exRanks=o.excludeRanks||[];
+  for(const e of prev){
+    if(!e||!e.login||members.includes(e.login)) continue;
+    const p=o.people&&o.people.get(e.login);
+    if(exRanks.includes(rankCode((p&&p.title)||e.title))) continue;
+    let ok=false;
+    if(isUnregEntry(e)) ok=true;
+    else if(p) ok=matchesDeptEntry(o.deptEntry,p)||isNonDutyDept(p.dept,o.nonDuty);
+    if(!ok) continue;
+    members.push(e.login); carried.push(e);
+  }
+  const pw=new Map(prev.filter(e=>e&&e.login).map(e=>[e.login,normWork(e)]));
+  for(const lg of members) if(pw.has(lg)) work[lg]=pw.get(lg);
+  for(const e of prev) if(e&&e.login&&e.seg&&members.includes(e.login)) seg[e.login]=e.seg;   // 20261031
+  return {members,work,seg,carried};
+}
+// 提出の確認に出す「Dr.JOY の所属医師」の変化。
+//   members = いまの名簿（login）。personOf(login) → 人（名簿外・名簿に無い人も）。doctors = 対象月の Dr.JOY の医師。
+//   add = 所属がこの科に当てはまらない人（初期研・名簿外・名簿に無い人は除く）。
+//   addNonDuty = そのうち当直をしない部署の人（所属はそのまま）。
+//   remove = 所属がこの科に当てはまるのに名簿にいない人（初期研・名簿外は除く）。
+//   changed = 前月の名簿と区分が違う人（prevWork = 前月の login → 区分。無ければ出さない）
+//   chosen = 集合当直で選んだ「Dr.JOY所属」（Map login → パターン。20261031）。選んだ医師は、その所属に合うかで見る
+//     （add の人には seg を付けて返す＝どの所属に加えるか。別の所属を選ばれた医師は、Dr.JOY の所属からは remove）
+function shozokuDiff(o){
+  const exRanks=o.excludeRanks||[], add=[], addNonDuty=[], remove=[], changed=[];
+  const inRoster=new Set(o.members||[]);
+  const chosen=o.chosen||new Map();
+  const entryFor=lg=>{ const sg=chosen.get(lg); if(!sg) return o.deptEntry;
+    return Array.isArray(o.deptEntry)?[sg]:Object.assign({},o.deptEntry,{dept:[sg]}); };
+  // 名簿外で入れた医師があとから Dr.JOY に登録されると、ログインIDが違うので「名簿にいない」に見える。氏名が同じなら名簿にいるとみなす（20261028）
+  const nk=o.nameKey||(s=>String(s||'').replace(/[ 　]/g,''));
+  const unregNames=new Set();
+  for(const lg of o.members||[]){ const p=o.personOf(lg); if(p&&isUnregEntry(p)) unregNames.add(nk(p.name)); }
+  for(const lg of o.members||[]){
+    const p=o.personOf(lg);
+    if(!p||isUnregEntry(p)||p.missing||exRanks.includes(rankCode(p.title))) continue;
+    if(matchesDeptEntry(entryFor(lg),p)) continue;
+    if(isNonDutyDept(p.dept,o.nonDuty)) addNonDuty.push(p);
+    else add.push(chosen.has(lg)?Object.assign({},p,{seg:chosen.get(lg)}):p);
+  }
+  for(const p of o.doctors||[]){
+    if(!p||isUnregEntry(p)||exRanks.includes(rankCode(p.title))) continue;
+    if(inRoster.has(p.login)&&matchesDeptEntry(entryFor(p.login),p)) continue;
+    if(inRoster.has(p.login)&&!chosen.has(p.login)) continue;
+    if(unregNames.has(nk(p.name))) continue;
+    if(matchesDeptEntry(o.deptEntry,p)) remove.push(p);
+  }
+  // 区分の変化。prevWork = 比べる相手の区分（Map）、または 'full'（比べる名簿が無い＝全員フルタイムとして比べる。20260927）
+  if(o.prevWork){
+    for(const lg of o.members||[]){
+      const p=o.personOf(lg);
+      if(!p||isUnregEntry(p)) continue;
+      let from;
+      if(o.prevWork==='full') from='full';
+      else if(o.prevWork.has(lg)) from=o.prevWork.get(lg);
+      else continue;
+      const to=o.workOf(lg);
+      if(from!==to) changed.push({p,from,to});
+    }
+  }
+  return {add,addNonDuty,remove,changed};
+}
+// 交代申請の中身（20260927 管理者: 誰から誰へ）。before/after = 原子レコード（frame_id,date,band,staff_login,oncall）。
+//   マス（枠×日×昼夜）ごとに、減った人（from）と増えた人（to）を出す。当↔オの切り替えも「乙部（当）→ 乙部（オ）」で出る。
+//   昼と夜で同じ変わり方なら1行にまとめる（bands=['昼','夜']）。並びは日付→枠→昼夜
+function kotaiChanges(before,after){
+  const key=r=>`${r.frame_id}|${r.date}|${r.band}`, val=r=>`${r.staff_login}|${r.oncall?1:0}`;
+  const grp=a=>{ const m=new Map(); for(const r of a||[]){ const k=key(r); if(!m.has(k)) m.set(k,new Set()); m.get(k).add(val(r)); } return m; };
+  const B=grp(before), A=grp(after), keys=new Set([...B.keys(),...A.keys()]);
+  const unpack=v=>{ const i=v.lastIndexOf('|'); return {login:v.slice(0,i),oncall:v.slice(i+1)==='1'}; };
+  const rows=[];
+  for(const k of keys){
+    const b=B.get(k)||new Set(), a=A.get(k)||new Set();
+    const from=[...b].filter(v=>!a.has(v)).sort(), to=[...a].filter(v=>!b.has(v)).sort();
+    if(!from.length&&!to.length) continue;
+    const [frame_id,date,band]=k.split('|');
+    rows.push({frame_id,date,band,from:from.map(unpack),to:to.map(unpack),sig:from.join(',')+'>'+to.join(',')});
+  }
+  const merged=new Map();
+  for(const r of rows){
+    const mk=`${r.frame_id}|${r.date}|${r.sig}`;
+    if(merged.has(mk)) merged.get(mk).bands.push(r.band);
+    else merged.set(mk,{frame_id:r.frame_id,date:r.date,bands:[r.band],from:r.from,to:r.to});
+  }
+  const BO={'昼':0,'夜':1};
+  const out=[...merged.values()];
+  for(const x of out) x.bands.sort((p,q)=>(BO[p]??9)-(BO[q]??9));
+  out.sort((p,q)=>p.date<q.date?-1:p.date>q.date?1:p.frame_id<q.frame_id?-1:p.frame_id>q.frame_id?1:(BO[p.bands[0]]??9)-(BO[q.bands[0]]??9));
+  return out;
+}
+// ローマ字 → ひらがな（①の検索欄。IME がオフのまま打っても探せる。20260927 管理者）。
+//   ヘボン式・訓令式のどちらも受ける。子音の重ね（tt）→っ、n の後ろが母音・y 以外なら ん。変換できない文字は捨てる
+//   （satoh → さと。よみがなの部分一致で探すので、伸ばす音の「う」が無くても当たる）。英字だけでないときは null
+function romajiToHira(s){
+  s=String(s||'').toLowerCase().replace(/[\s'’-]/g,'');
+  if(!s||!/^[a-z]+$/.test(s)) return null;
+  const T={a:'あ',i:'い',u:'う',e:'え',o:'お',
+    ka:'か',ki:'き',ku:'く',ke:'け',ko:'こ',ga:'が',gi:'ぎ',gu:'ぐ',ge:'げ',go:'ご',
+    sa:'さ',si:'し',shi:'し',su:'す',se:'せ',so:'そ',za:'ざ',zi:'じ',ji:'じ',zu:'ず',ze:'ぜ',zo:'ぞ',
+    ta:'た',ti:'ち',chi:'ち',tu:'つ',tsu:'つ',te:'て',to:'と',da:'だ',di:'ぢ',du:'づ',de:'で',do:'ど',
+    na:'な',ni:'に',nu:'ぬ',ne:'ね',no:'の',ha:'は',hi:'ひ',hu:'ふ',fu:'ふ',he:'へ',ho:'ほ',
+    ba:'ば',bi:'び',bu:'ぶ',be:'べ',bo:'ぼ',pa:'ぱ',pi:'ぴ',pu:'ぷ',pe:'ぺ',po:'ぽ',
+    ma:'ま',mi:'み',mu:'む',me:'め',mo:'も',ya:'や',yu:'ゆ',yo:'よ',
+    ra:'ら',ri:'り',ru:'る',re:'れ',ro:'ろ',wa:'わ',wo:'を',
+    kya:'きゃ',kyu:'きゅ',kyo:'きょ',gya:'ぎゃ',gyu:'ぎゅ',gyo:'ぎょ',
+    sha:'しゃ',shu:'しゅ',sho:'しょ',sya:'しゃ',syu:'しゅ',syo:'しょ',
+    ja:'じゃ',ju:'じゅ',jo:'じょ',jya:'じゃ',jyu:'じゅ',jyo:'じょ',zya:'じゃ',zyu:'じゅ',zyo:'じょ',
+    cha:'ちゃ',chu:'ちゅ',cho:'ちょ',tya:'ちゃ',tyu:'ちゅ',tyo:'ちょ',
+    nya:'にゃ',nyu:'にゅ',nyo:'にょ',hya:'ひゃ',hyu:'ひゅ',hyo:'ひょ',bya:'びゃ',byu:'びゅ',byo:'びょ',
+    pya:'ぴゃ',pyu:'ぴゅ',pyo:'ぴょ',mya:'みゃ',myu:'みゅ',myo:'みょ',rya:'りゃ',ryu:'りゅ',ryo:'りょ'};
+  let out='',i=0;
+  while(i<s.length){
+    const c=s[i], n1=s[i+1];
+    if(c==='n'&&(n1===undefined||!/[aiueoy]/.test(n1))){
+      out+='ん'; i+=1;
+      if(n1==='n'&&!/[aiueoy]/.test(s[i+1]||'')) i+=1;   // nn（かんの の kanno は ん＋の、末尾や子音の前の nn は ん1つ）
+      continue; }
+    if(c===n1&&!/[aiueon]/.test(c)){ out+='っ'; i+=1; continue; }
+    let hit=false;
+    for(const L of [3,2,1]){ const k=s.slice(i,i+L); if(T[k]){ out+=T[k]; i+=L; hit=true; break; } }
+    if(!hit) i+=1;                // h（satoh の h など）・変換できない文字は捨てる
+  }
+  return out||null;
+}
+// 並べ替えの鍵: 姓（漢字・よみ）が打った文字で始まれば 0、それ以外 1
+function surnameFirst(p,q,qr){
+  const sei=String(p.name||'').split(/[\s　]+/)[0], kana=String(p.kana||'').split(/[\s　]+/)[0];
+  if(q&&(sei.startsWith(q)||kana.startsWith(q))) return 0;
+  if(qr&&kanaFold(kana).startsWith(kanaFold(qr))) return 0;
+  return 1;
+}
+// ローマ字で打ったときは、姓の頭（姓名続けても可）から合う人だけ（名や途中には当てない。20260927 管理者「姓だけ」）
+function romajiHit(kana,qr){
+  const q=kanaFold(qr), words=String(kana||'').split(/[\s　]+/).filter(Boolean);
+  return kanaFold(words.join('')).startsWith(q);     // 姓の頭から（名だけのローマ字では探さない。20260927 管理者）
+}
+// 伸ばす音を畳む（ヘボン式は りゅういち を ryuichi、おおの を ono と書く）。検索で、よみがなと打った文字の両方にかけて比べる
+function kanaFold(s){
+  return String(s||'').replace(/([おこごそぞとどのほぼぽもよろょを])[うお]/g,'$1').replace(/([うくぐすずつづぬふぶぷむゆるゅ])う/g,'$1');
+}
+// 本番の最初の月（'YYYY-MM'）より前なら予行の月（20260927 管理者: 10月フォルダは試しに使う）
+function isRehearsalMonth(y,m,realFrom){
+  const [ry,rm]=String(realFrom||'').split('-').map(Number);
+  if(!ry||!rm) return false;
+  return y*12+m < ry*12+rm;
+}
+// 連続当直（救急科と小児科＝config の consecutiveWarnOwners）。当直（泊まる・「当」）だけを見る。オンコールは数えない。
+//   20261025 管理者: 夜の当直の翌日の当直は勤務間インターバルが取れず Dr.JOY が受け付けない → いったん提出を止めた。
+//   20261026 管理者: 止めずに注意に戻す。勤務間インターバルは通常勤務も含めた連続の勤務で見るので、夜の当直の日の日中の通常勤務を
+//     外せば（年休など）、夜→翌日の昼は約24時間の連続勤務になって満たす（例 R8.11 救急の丁野医師 11/12 夜→11/13 昼。12日昼は休暇）。
+//     止めたままだと、その組が残る科は交代申請を1件も出せない。
+//   20261026 管理者（同日・決定）: 夜の当直を続けて組む（夜→翌日の夜）のは禁止 → これだけ提出を止める（errs・kind:'interval'）。
+//     通常勤務を外しても休みが取れない（夜と夜の間は 8〜9時間）。外した時間は年休でなく勤務時間上の休み。
+//   注意（warns・kind:'interval'）:
+//     夜→翌日の昼で、夜の当直の日が通常勤務の日（平日・開院記念日）→「その日の日中の通常勤務を外す（勤務時間上の休み）必要」
+//     それ以外の連日（土日祝の夜→翌日の昼、昼→翌日の昼など）→ 今までどおり「連続しています」（1人1件）
+//   開院記念日など daytimeOncallOnly の日の昼は全員オンコールになるので当直に数えない（ただしその日は通常勤務の日として扱う）。
+//   duties = [{login, date, band, oncall}]、days = cfg.days。月をまたぐ組（前の月の末日の夜）はここでは見えない。
+function consecutiveChecks(duties,days,nameOf){
+  const dayOf=d=>(days||[]).find(x=>x.date===d)||{};
+  const per=new Map();
+  for(const r of duties||[]){
+    if(r.oncall||!r.login||!r.date) continue;
+    if(r.band==='昼'&&dayOf(r.date).daytimeOncallOnly) continue;
+    const m=per.get(r.login)||per.set(r.login,new Map()).get(r.login);
+    (m.get(r.date)||m.set(r.date,new Set()).get(r.date)).add(r.band);
+  }
+  const next=d=>{const t=new Date(d+'T00:00:00Z'); t.setUTCDate(t.getUTCDate()+1); return t.toISOString().slice(0,10);};
+  const errs=[],warns=[];
+  for(const [lg,m] of per){
+    const nm=nameOf?nameOf(lg):lg;
+    let warned=false;
+    for(const d of [...m.keys()].sort()){
+      const nx=next(d);
+      if(!m.has(nx)) continue;
+      const dd=+d.slice(8,10), nd=+nx.slice(8,10), day=dayOf(d);
+      const workday=!day.holiday||!!day.daytimeOncallOnly;      // その日に日中の通常勤務がある
+      if(m.get(d).has('夜')&&m.get(nx).has('昼')&&workday)
+        warns.push({kind:'interval',dates:[d,nx],msg:`${nm}: ${dd}日の夜の当直の翌日（${nd}日）の昼にも当直です。${dd}日の日中の通常勤務を外す（勤務時間上の休み）必要があります（勤務間インターバル。外さないと Dr.JOY が受け付けません）`});
+      else if(m.get(d).has('夜')&&m.get(nx).has('夜'))
+        errs.push({kind:'interval',dates:[d,nx],msg:`${nm}: ${dd}日と${nd}日に続けて夜の当直です。夜の当直を続けて組むことはできません（勤務間インターバルが取れないため）`});
+      else if(!warned){ warned=true;
+        warns.push({dates:[d,nx],msg:`${nm} が ${dd}日→${nd}日 と連続しています`}); }
+    }
+  }
+  return {errs,warns};
+}
+// @pure-end
+
+// ---- 設定の読込（Electron=IPC / ブラウザ=埋め込みJSON）----
+let cfg;
+try{
+  if(IS_APP){ cfg=await window.td.loadConfig(); }
+  else{
+    const t=$('#cfgdata').textContent.trim();
+    if(t==="__CONFIG"+"_JSON__") throw new Error("このHTMLは月次生成器が作った月別ファイルで開いてください");
+    cfg=JSON.parse(t);
+  }
+}catch(e){
+  $('#loaderr').style.display='block';
+  $('#loaderr').textContent='設定を読み込めませんでした: '+(e&&e.message||e);
+  return;
+}
+$('#title').textContent='当直勤務表';
+document.title=`当直勤務表（R${cfg.reiwa}年${cfg.month}月）`;
+$('#deadline').textContent='';   // 締切は右の月の札に出す（2か所に出さない。20260927）
+document.querySelectorAll('.tgtMonth').forEach(el=>el.textContent=`【R${cfg.reiwa}年${cfg.month}月】`);
+$('#envNote').textContent=IS_APP?'':'ブラウザ版（提出ファイルはダウンロード保存 → メールで提出）';
+
+// ---- 共有マスター（全科の予定）。起動のたびに読む。ローカルに写しは持たない ----
+let master=null, myRev=null;
+if(IS_APP){
+  const mr=await window.td.loadMaster({year:cfg.year,month:cfg.month});
+  if(!mr.ok){
+    $('#loaderr').style.display='block';
+    // マスターが見えない（無いのに _履歴 に版がある）ときは、その平易な文だけを出す（20260926）
+    $('#loaderr').textContent=mr.hidden?mr.error
+      :'共有の当直予定表が読めません（共有フォルダに繋がっていない可能性があります）: '+mr.error;
+    return;
+  }
+  master=mr.master;
+}
+// 対象月の帯（月ごとに色を変える）と、決裁の前／後で変わる画面の言葉
+//   20260923: 決裁済み（マスターの confirmed）でも閲覧のみにはしない。直して出し直した分は当直交代として記録される
+//   20260924 管理者: 決裁後の変更は「交代申請」。事務担当・事務担当2が承認したものだけが毎日15時に当直表へ反映される
+//   20260926: 関数にした。開いたままの画面が③確定（または解除）に追いつけるように、科の切替と提出の直前に
+//   cfg.confirmed を読み直して呼び直す（両方向に切り替える）
+const MONTH_HUES=[210,340,25,140,265,190,0,60,300,110,230,20];
+const CONFIRM_Q_NORMAL=$('#confirmOv .confirm-q').innerHTML;
+function applyConfirmedUI(){
+  const on=!!cfg.confirmed;
+  const b=$('#monthBand');
+  b.style.setProperty('--mh',`hsl(${MONTH_HUES[(cfg.month-1)%12]} 70% 62%)`);
+  // 決裁後は「当直交代申請」の画面として見せる（事務担当の気持ちに寄せる。20260925 管理者）
+  $('#title').textContent=on?'当直交代申請':'当直勤務表';     // 月は右の札に出す（20260927 管理者: 「入力」「R8年N月」は不要）
+  document.title=on?`当直交代申請（R${cfg.reiwa}年${cfg.month}月）`:`当直勤務表（R${cfg.reiwa}年${cfg.month}月）`;
+  b.innerHTML=on
+    ?`<span class="dot"></span><span class="main">R${cfg.reiwa}年${cfg.month}月分の当直交代申請</span><span class="sub">病院長決裁済み</span>`
+      +'<span class="closedtag">赤字＝決裁の当直表から変わった／黄色＝まだ申請していない</span>'
+    :`<span class="dot"></span><span class="main">R${cfg.reiwa}年${cfg.month}月分の当直予定</span><span class="sub">${cfg.year}年${cfg.month}月${cfg.deadline?'　締切 '+cfg.deadline:''}</span>`;
+  const [from,to]=on?['当直の割当','当直の交代']:['当直の交代','当直の割当'];
+  for(const h of document.querySelectorAll('h2')) for(const t of h.childNodes)
+    if(t.nodeType===3&&t.nodeValue.includes(from)) t.nodeValue=t.nodeValue.replace(from,to);
+  $('#dirtyArrow').title=on?'まだ申請されていません（黄色の欄）':'まだ提出されていません（黄色の欄）';
+  $('#submitBtn').textContent=on?'交代申請する':'この内容で提出する';
+  $('#confirmOv .confirm-q').innerHTML=on
+    ?'<b id="cfDept">—</b> の R<span id="cfYm"></span> の交代を申請します。'
+    :CONFIRM_Q_NORMAL;
+  $('#cfYes').textContent=on?'はい、申請します':'はい、提出します';
+  $('#doneMsg').textContent=on?'交代を申請しました':'提出が完了しました';
+}
+// ---- ①と②の境界をドラッグで動かす（20260927 管理者）。位置は窓の幅に対する割合で持ち、窓を広げると左の名簿も広がる。
+//   割合はこの PC・この Windows アカウントに覚える（ダブルクリックで既定に戻す）
+(function(){
+  // 既定は窓の幅の 32%（20260927 管理者: 24% では①の説明が収まらない。キーを変えて全員この既定からやり直す）
+  const sp=$('#splitter'), sec=$('#memberSec'), KEY='td.sideRatio2', DEF=0.32, MINW=360, MAXR=0.6;   // MINW: 150% でも × の列まで入る幅
+  let ratio=DEF;
+  try{ const v=parseFloat(localStorage.getItem(KEY)); if(v>0&&v<1) ratio=v; }catch(_){}
+  const apply=()=>{ const W=window.innerWidth;
+    sec.style.width=Math.max(MINW,Math.min(Math.round(W*ratio),Math.round(W*MAXR)))+'px'; };
+  apply();
+  let x0=0,w0=0;
+  const move=e=>{ ratio=Math.max(0.05,Math.min((w0+(e.clientX-x0))/window.innerWidth,MAXR)); apply(); };
+  const up=()=>{ sp.classList.remove('drag'); document.body.classList.remove('splitting');
+    window.removeEventListener('pointermove',move); window.removeEventListener('pointerup',up);
+    try{ localStorage.setItem(KEY,ratio.toFixed(4)); }catch(_){} };
+  sp.addEventListener('pointerdown',e=>{ e.preventDefault(); x0=e.clientX; w0=sec.getBoundingClientRect().width;
+    sp.classList.add('drag'); document.body.classList.add('splitting');
+    window.addEventListener('pointermove',move); window.addEventListener('pointerup',up); });
+  sp.addEventListener('dblclick',()=>{ ratio=DEF; apply(); try{ localStorage.removeItem(KEY); }catch(_){} });
+  window.addEventListener('resize',apply);
+})();
+// ---- 画面の拡大（20260927 管理者）: タイトルバーの「文字を大きく」＝100%↔150%、Ctrl＋ホイール・Ctrl＋＋／－で 80〜150%、
+//   Ctrl＋0 で 100%。倍率はこの PC・この Windows アカウントに覚える ----
+(function(){
+  const KEY='td.zoom', MIN=0.8, MAX=1.5, STEP=0.1, BIG=1.5, btn=$('#zoomBtn');
+  let z=1;
+  try{ const v=parseFloat(localStorage.getItem(KEY)); if(v>=MIN&&v<=MAX) z=v; }catch(_){}
+  const set=v=>{
+    z=Math.round(Math.max(MIN,Math.min(MAX,v))*10)/10;
+    if(window.td&&window.td.setZoom) window.td.setZoom(z);
+    btn.classList.toggle('on',z>=1.25);
+    btn.textContent=z>=1.25?'文字を元に':'文字を大きく';
+    try{ localStorage.setItem(KEY,String(z)); }catch(_){}
+    window.dispatchEvent(new Event('resize'));   // 左の名簿の幅（窓の幅に対する割合）を付け直す
+  };
+  set(z);
+  btn.addEventListener('click',()=>set(z>=1.25?1:BIG));
+  window.addEventListener('wheel',e=>{ if(!e.ctrlKey) return; e.preventDefault(); set(z+(e.deltaY<0?STEP:-STEP)); },{passive:false});
+  window.addEventListener('keydown',e=>{
+    if(!e.ctrlKey) return;
+    if(e.key==='0'){ e.preventDefault(); set(1); }
+    else if(e.key==='+'||e.key==='='||e.key===';'){ e.preventDefault(); set(z+STEP); }
+    else if(e.key==='-'){ e.preventDefault(); set(z-STEP); }
+  });
+})();
+applyConfirmedUI();
+// 画面を描いたあとに決裁の状態が変わったときの知らせ（平易な文で。20260926）
+const CONFIRM_CHANGED_MSG={
+  confirmed:'この月は決裁されました。これからの変更は当直交代申請になります（承認されてから反映）。',
+  unconfirmed:'この月の決裁が取り消されました。これからは通常の提出になります。',
+};
+
+// roster index
+const doctors=cfg.roster.filter(p=>p.doctor);
+const byLogin=new Map(cfg.roster.map(p=>[p.login,p]));
+const exactMap=new Map(), canonMap=new Map();
+for(const p of cfg.roster){
+  const k1=nfc(namekey(p.name)), k2=canon(p.name);
+  (exactMap.get(k1)||exactMap.set(k1,[]).get(k1)).push(p);
+  (canonMap.get(k2)||canonMap.set(k2,[]).get(k2)).push(p);
+}
+function resolveName(n){
+  const hits=exactMap.get(nfc(namekey(n)))||[];
+  if(hits.length===1) return hits[0];
+  if(hits.length>1) return "ambiguous";
+  const h2=canonMap.get(canon(n))||[];
+  if(h2.length===1) return h2[0];
+  if(h2.length>1) return "ambiguous";
+  return null;
+}
+
+// owners
+// retired=true は消滅した科の枠（20260913 管理者決定: 内科 旧科）。入力させないので
+// 科セレクタからも枠からも外す。取込・互換出力の側（contract.py）では今までどおり解釈する。
+const isActive=f=>!f.retired;
+const owners=[];
+for(const f of cfg.frames){ if(!isActive(f)) continue; const o=f.owner||f.dept; if(!owners.includes(o)) owners.push(o); }
+// 「管理者」は科セレクタに出さない（2026-08-30フィードバック。管理当直などの手作業枠は
+// 後日の専用インポート機能で取り込む。framesの管理者枠と集約器の受け口はそのまま）
+for(const o of owners){ if(o==='管理者') continue;
+  const op=document.createElement('option'); op.value=o; op.textContent=o; $('#deptSel').appendChild(op); }
+
+// state
+// grid: `${frame_id}|${date}|${band}|${slot}` -> {login,oncall}。band は常に 昼/夜
+// （20260831ユーザー決定: 「全日」「昼夜」バンドは廃止。データは昼・夜の2本で持つ）
+let owner=null, ownFrames=[], members=[], grid=new Map();
+// 決裁のときの割当（決裁済みの月だけ）。'枠|日|昼夜' → Map(login→oncall)。変わったマスを赤くするのに使う（20260924）
+let baseIdx=null;
+// 最後に読み込んだ／提出したときの割当（'枠|日|昼夜' → Map(login→oncall)）。たった今変えた欄を黄色にするのに使う（20260924）
+let savedIdx=null;
+function gridIdx(){
+  const m=new Map();
+  for(const [k,v] of grid){
+    const ck=k.split('|').slice(0,3).join('|');
+    if(!m.has(ck)) m.set(ck,new Map());
+    m.get(ck).set(v.login,!!v.oncall);
+  }
+  return m;
+}
+function repaintAll(){ for(const fns of chgPainters.values()) for(const fn of fns) fn(); }
+const chgPainters=new Map();     // '枠|日|昼夜' → [そのマスの欄を塗り直す関数]（renderGrid ごとに作り直す）
+function buildBaseIdx(list){
+  const m=new Map();
+  for(const r of list||[]){
+    const k=`${r.frame_id}|${r.date}|${r.band}`;
+    if(!m.has(k)) m.set(k,new Map());
+    m.get(k).set(r.staff_login,!!r.oncall);
+  }
+  return m;
+}
+function cellLogins(ck){        // いまのマスに入っている人（login→oncall）
+  const m=new Map();
+  for(const [k,v] of grid){ if(k.startsWith(ck+'|')) m.set(v.login,!!v.oncall); }
+  return m;
+}
+function repaintCells(cks){ for(const ck of cks) for(const fn of (chgPainters.get(ck)||[])) fn(); }
+function countInCell(ck,lg){    // このマスにその人が何回入っているか（同じ人の2回入りの印に使う。20260926）
+  let n=0;
+  for(const [k,v] of grid){ if(v.login===lg&&k.startsWith(ck+'|')) n++; }
+  return n;
+}
+// 読み直した共有マスターの confirmed が、この画面の前提（cfg.confirmed）と違えば画面を切り替える（20260926）。
+//   決裁のときの割当（baseline）も読み直したマスターから取り直す（赤字の比べ先）。変わったら 'confirmed'/'unconfirmed'
+function syncConfirmed(conf,masterNow){
+  const ch=confirmChange(cfg.confirmed,conf);
+  if(!ch) return null;
+  cfg.confirmed=conf||null;
+  applyConfirmedUI();
+  if(owner){
+    const ent=masterNow&&(masterNow.depts||{})[owner];
+    baseIdx=cfg.confirmed?buildBaseIdx((ent&&ent.baseline)||[]):null;
+    renderChips();          // 決裁後は × と区分を止める（20260927）
+    repaintAll();
+  }
+  refresh();
+  return ch;
+}
+// 勤務の区分の申告 login → 'part'/'ingai'（載っていない人はフルタイム。20260927 管理者: 常勤/当直のみ → 3区分）
+let workMap=new Map();
+const workOf=lg=>normWork({work:workMap.get(lg)});
+function setWork(lg,w){ w=normWork({work:w}); if(w==='full') workMap.delete(lg); else workMap.set(lg,w); }
+// 集合当直で庶務が選んだ「Dr.JOY所属」 login → パターン（Dr.JOY の所属と同じなら持たない。20261031 コードレビュー③）
+let segMap=new Map();
+const ownerPats=o=>entryPats(deptEntryOf(o));
+const isComposite=o=>isDefining(o)&&ownerPats(o).length>=2;
+// いまの名簿でのこの医師の「Dr.JOY所属」（選んだもの → Dr.JOY の所属）。集合当直でなければ null
+function segOf(lg){ const p=byLogin.get(lg)||{}; return memberSegR(segMap.get(lg),p.dept,ownerPats(owner)); }
+// 集合当直の中の1科の枠の所属パターン（枠の dept が提出単位と違い、dept_map に載っているときだけ。ほかは null＝注意しない）
+function framePatsOf(f){
+  if(!f||!isComposite(owner)||f.role!=='second'||f.dept===owner) return null;
+  const p=entryPats((cfg.deptMap||{})[f.dept]);
+  return p.length?p:null;
+}
+// 保存する seg（集合当直だけ）
+const segToSave=lg=>isComposite(owner)?(segMap.get(lg)||null):null;
+// 前月に同じ科が出した名簿の区分（login → 区分）。前月の予定が読めない・前月に出していなければ null（提出の確認の「区分が変わる」に使う）
+let prevMonthWork=null;
+// 所属の申告の対象（config.shozoku。無い古い config は既定値）
+const SHZ=shozokuSpec(cfg.shozoku,owners);
+const isDefining=o=>!!o&&SHZ.owners.includes(o);
+// 科の選択に「Dr.JOY所属」を添える（名前の違う単位だけ。例「内科C 血液神経 ＝ 内科(血液・膠原病)・内科(神経)」。20261031 コードレビュー④）
+for(const op of $('#deptSel').options){
+  const nt=op.value&&isDefining(op.value)?drjoyNote(op.value,entryPats((cfg.deptMap||{})[op.value])):'';
+  if(nt) op.textContent=`${op.value} ＝ ${nt}`;
+}
+const WORK_LABEL={full:'フルタイム',part:'パートタイム',ingai:'院外研修専従'};
+const WORK_TIP={
+  full:'フルタイム: 平日は毎日、当院で日中勤務する医師（産休・育休・病休中も含む）。クリックで切り替え',
+  part:'パートタイム: 当直・外来など、一部だけ当院の仕事をしに来る医師（大学院生・院外研修で外来や当直に来る・近隣の病院などから当直だけ）。クリックで切り替え',
+  ingai:'院外研修専従: 院外研修中で、当院の仕事はしていない医師（貴科の医師のまま）。クリックで切り替え',
+};
+let shareGroups=[];     // 昼夜共通スイッチの対象グループ（同じ科名×役割の枠の束）
+let share=new Map();    // group.key -> bool（ON=1回の入力を昼と夜の両方に保存）
+const holidays=new Map(cfg.days.map(d=>[d.date,d]));
+
+// 開院記念日（daytimeOncallOnly）の昼は管理当直を置かない（院長がいる。管理者 20260923）＝枠マスタの skip_daytime_oncall_only
+function applicable(f,d){ return !(f.shape==='昼' && (!d.holiday || (f.skip_daytime_oncall_only && d.daytimeOncallOnly))); }
+function bandsOf(f,d){ if(f.shape==='全日') return d.holiday?['昼','夜']:['夜']; return [f.shape]; }
+
+// ---- 昼夜共通スイッチ（20260831ユーザー決定）----
+// グループ = owner内の 同じ科名 × 同じ役割 の枠の束。全日枠1本（昼と夜を同じ枠が
+// 持つ）も、昼枠+夜枠のペア（救急科型・DTX14が全日行を分けた後の形）も同じに扱う。
+// スイッチが効くのは「その日に昼と夜の両方が存在する日」（主に土日祝）。
+function groupBands(fs,d){   // その日の band -> 担当する枠（重複供給があれば共有不可扱い）
+  const m={};
+  for(const f of fs){
+    if(!applicable(f,d)) continue;
+    for(const b of bandsOf(f,d)){ if(m[b]) return null; m[b]=f; }
+  }
+  return m;
+}
+function buildShareGroups(){
+  const gs=new Map();
+  for(const f of ownFrames){
+    const k=namekey(f.dept)+'|'+f.role;
+    (gs.get(k)||gs.set(k,[]).get(k)).push(f);
+  }
+  shareGroups=[];
+  for(const [key,fs] of gs){
+    const capable=cfg.days.some(d=>{const m=groupBands(fs,d); return m&&m['昼']&&m['夜'];});
+    if(capable) shareGroups.push({key,frames:fs,
+      def:fs.every(f=>f.share_day_night)});   // 既定ON = 現行の全日(昼夜)枠（config指定）
+  }
+}
+function bandContent(g,d,band){  // グループのその日そのバンドの入力（比較用の正規形）
+  const items=[];
+  for(const f of g.frames){
+    if(!applicable(f,d)||!bandsOf(f,d).includes(band)) continue;
+    const pre=`${f.frame_id}|${d.date}|${band}|`;
+    for(const [key,v] of grid) if(key.startsWith(pre)&&v.login)
+      items.push((v.oncall?'O':'D')+'|'+v.login);
+  }
+  return items.sort().join(',');
+}
+function mismatchDays(g){        // 昼と夜の入力が食い違う日（OFF→ONのブロック判定）
+  const out=[];
+  for(const d of cfg.days){
+    const m=groupBands(g.frames,d);
+    if(!(m&&m['昼']&&m['夜'])) continue;
+    if(bandContent(g,d,'昼')!==bandContent(g,d,'夜')) out.push(d.day);
+  }
+  return out;
+}
+// 20260922 管理者決定: 全日タイプ／昼夜タイプは月ごとにデータから決める。
+//   その月に入力がある科 … 土日祝のすべての日で昼と夜の顔ぶれ（人＋当/オ）が同じ = 全日タイプ(ON)。
+//                          1日でも違えば昼夜タイプ(OFF)。人数だけ違う日も「違う」（bandContent の比較）。
+//   まだ何も入っていない科 … 前月のタイプを引き継ぐ（applyPrevTypes）。前月が無ければ枠マスタの固定値。
+function computeShare(hasData){
+  share=new Map();
+  for(const g of shareGroups)
+    share.set(g.key, hasData ? mismatchDays(g).length===0 : g.def);
+}
+// 空の月: 前月のマスターから同じ規則で求めたタイプを当てる（取れなければ枠マスタの固定値のまま）
+async function applyPrevTypes(){
+  if(!owner||!shareGroups.length) return;
+  if(!(IS_APP&&window.td&&window.td.loadPrevTypes)) return;
+  let r=null;
+  try{ r=await window.td.loadPrevTypes({year:cfg.year,month:cfg.month,owner}); }catch(_){ return; }
+  if(!r||!r.ok||!r.types) return;
+  if(owner!==$('#deptSel').value) return;     // 待っている間に科が切り替わっていたら捨てる
+  let hit=0;
+  // 待っている間に入力（取込を含む）があれば、昼と夜が食い違うグループは ON にしない（OFF→ON のブロックと同じ。20261009）
+  for(const g of shareGroups)
+    if(Object.prototype.hasOwnProperty.call(r.types,g.key)){
+      share.set(g.key,!!r.types[g.key]&&mismatchDays(g).length===0); hit++; }
+  console.log(`[share] 前月(${r.year}年${r.month}月)のタイプを引き継ぎ: ${hit}/${shareGroups.length}件`);
+  if(hit){ normalizeShare(); renderShareBar(); renderGrid(); refresh(); }
+}
+function reconcileShare(){       // 取込後: ONのままだと食い違うグループだけOFFへ（データは消さない）
+  for(const g of shareGroups)
+    if(share.get(g.key)&&mismatchDays(g).length) share.set(g.key,false);
+}
+// 昼夜共通ONの欄は「昼の s 番目の人」を見せて、昼と夜の s 番目の両方に書く。顔ぶれが同じでも並びが違うと
+// 画面と夜の保存が食い違う（夜の別の人を上書きする）ので、ONのグループは夜の並びを昼に揃える（20260925）。
+// 顔ぶれ（人＋当/オ）が同じ日だけ揃える＝データの中身は変えない。スイッチON・科の復元・取込のあとに呼ぶ
+function normalizeShare(){
+  for(const g of shareGroups){
+    if(!share.get(g.key)) continue;
+    for(const d of cfg.days){
+      const m=groupBands(g.frames,d);
+      if(!(m&&m['昼']&&m['夜'])) continue;
+      if(bandContent(g,d,'昼')!==bandContent(g,d,'夜')) continue;
+      const preD=`${m['昼'].frame_id}|${d.date}|昼|`, preN=`${m['夜'].frame_id}|${d.date}|夜|`;
+      const day=[...grid].filter(([k,v])=>k.startsWith(preD)&&v.login);
+      for(const k of [...grid.keys()]) if(k.startsWith(preN)) grid.delete(k);
+      for(const [k,v] of day) grid.set(preN+k.slice(preD.length),{login:v.login,oncall:!!v.oncall});
+    }
+  }
+}
+function groupDisp(g){
+  const depts=new Set(ownFrames.map(x=>namekey(x.dept)));
+  if(depts.size>1) return frameLabel(g.frames[0]);
+  return roleDisp(g.frames[0]);
+}
+function renderShareBar(){
+  const bar=$('#shareBar'); bar.innerHTML='';
+  if(!owner||!shareGroups.length){ bar.style.display='none'; return; }
+  bar.style.display='flex';
+  const cap=document.createElement('span'); cap.className='shcap'; cap.textContent='昼夜共通スイッチ:';
+  bar.appendChild(cap);
+  for(const g of shareGroups){
+    const on=!!share.get(g.key);
+    const b=document.createElement('button'); b.className='shsw '+(on?'on':'off');
+    b.innerHTML=`<span class="knob"></span><span>${groupDisp(g)}　昼夜共通 ${on?'ON':'OFF'}</span>`;
+    b.title=on
+      ?'ON: 土日祝など昼と夜の両方がある日は1つの欄で入力し、昼と夜の両方に保存されます。クリックでOFFにすると昼と夜を別々に入力します'
+      :'OFF: 昼と夜を別々の欄で入力します。クリックでON（1回の入力を昼と夜の両方に保存）';
+    b.addEventListener('click',()=>{
+      if(share.get(g.key)){ share.set(g.key,false); }
+      else{
+        const days=mismatchDays(g);
+        if(days.length){
+          alert(`【${groupDisp(g)}】昼と夜の入力が違う日があります（${days.join('日・')}日）。\n`
+            +'共通にするには、先にその日の昼と夜を同じ内容に揃えてください。\n（入力は消していません。昼・夜別々のまま提出もできます）');
+          return;
+        }
+        share.set(g.key,true);
+        normalizeShare();          // 夜の並びを昼に揃える（中身は同じ。20260925）
+      }
+      renderShareBar(); renderGrid(); refresh();
+    });
+    bar.appendChild(b);
+  }
+}
+function defaultMembers(o){
+  // 決まった初期メンバー（管理当直 = 管理当直アプリの名簿。管理者 20260923）があれば、所属パターンより優先
+  const fx=(cfg.fixedMembers&&cfg.fixedMembers[o])||[];
+  if(fx.length) return fx.map(x=>x.login).filter(lg=>byLogin.has(lg));
+  // dept_map の1項目 = 所属パターンの配列、または {dept:[...], rank:["初"]}（20260913: 職位条件。
+  // 内科C 初期研 = 血液膠原病・神経に所属する初期研だけ。contract.matches_dept_map と同じ規則）
+  //   20260927: 判定は matchesDeptEntry（@pure の区間。提出の確認の所属の変化と同じ規則）
+  const e=deptEntryOf(o);
+  return doctors.filter(p=>matchesDeptEntry(e,p)).map(p=>p.login);
+}
+function deptEntryOf(o){ return (cfg.deptMap&&cfg.deptMap[o])||[]; }
+
+// ---- 名簿の並び順（2026-08-30フィードバック・同日追修正）:
+//   職位ランク（医師(教員)→大学院生→専攻医→初期研→その他。rankOf は @pure の区間）
+//   → 教員はDr.JOYログインIDの昇順（ID番号=採用順の序列）
+//   → それ以外は期の小さい順 → 五十音（かな）
+function kiOf(t){ const m=String(t||'').match(/(\d+)期/); return m?+m[1]:999; }
+function cmpPerson(a,b){
+  const ra=rankOf(a.title),rb=rankOf(b.title);
+  if(ra!==rb) return ra-rb;
+  if(ra===0){  // 教員はログインIDの昇順（序列）。IDが無い人は後ろ
+    const la=String(a.login||'').split('@')[0], lb=String(b.login||'').split('@')[0];
+    if(la!==lb) return (la||'~')<(lb||'~')?-1:1;
+  }
+  const ka=kiOf(a.title),kb=kiOf(b.title);
+  if(ka!==kb) return ka-kb;
+  const na=namekey(a.kana)||namekey(a.name), nb=namekey(b.kana)||namekey(b.name);
+  return na<nb?-1:na>nb?1:0;
+}
+function sortMembers(){
+  // 決まった初期メンバー（管理当直）は、管理当直アプリの名簿の並び（order）で。無い人は末尾に職位順（管理者 20260923）
+  const fo=new Map(((cfg.fixedMembers||{})[owner]||[]).map(x=>[x.login,x.order??999]));
+  members.sort((x,y)=>{
+    if(fo.size){ const a=fo.has(x)?fo.get(x):1e9, b=fo.has(y)?fo.get(y):1e9; if(a!==b) return a-b; }
+    return cmpPerson(byLogin.get(x)||{},byLogin.get(y)||{});
+  });
+}
+
+// ---- ① members ----
+// その月に当直・オンコールが入っているか（いまの割当、または決裁のときの割当）。決裁後の × の可否に使う（20261028）
+function hasDutyIn(lg){
+  for(const v of grid.values()) if(v.login===lg) return true;
+  if(baseIdx) for(const m of baseIdx.values()) if(m.has(lg)) return true;
+  return false;
+}
+function renderChips(){   // ①名簿 = 左サイドバーの表（行順は名簿ソート順のまま）
+  sortMembers();
+  const tb=$('#memTbl'); tb.innerHTML='';
+  const def=isDefining(owner);
+  // 決裁後（交代申請モード）は、当直の入っている医師の × を止める（20260927 管理者: × は割当も外すので、
+  //   うっかり押すと当直がまとめて消える）。20261028: 当直の無い医師の × と区分の切り替えはできる
+  const locked=!!cfg.confirmed;
+  const canRoster=rosterEditable(owner);
+  renderShozokuHead();
+  let nAll=0; const nW={full:0,part:0,ingai:0};
+  // 集合当直（内科 消化器・呼吸器など）は「Dr.JOY所属」ごとに分けて見せ、医師ごとに所属を選べる（20261031 コードレビュー③）
+  const comp=isComposite(owner), pats=comp?ownerPats(owner):[];
+  const groups=comp?[...pats.map(t=>({key:t,label:`「Dr.JOY所属」${t}`})),
+    {key:null,label:'「Dr.JOY所属」が決まっていない医師',tip:'どちらの「Dr.JOY所属」の医師か、右の欄で選んでください（部門管理者だけが選べます）'}]:[{key:undefined}];
+  for(const g of groups){
+  const list=comp?members.filter(lg=>byLogin.has(lg)&&segOf(lg)===g.key):members;
+  if(comp){
+    if(!list.length) continue;
+    const gr=document.createElement('tr'); gr.className='grp'+(g.key===null?' unk':'');
+    const gd=document.createElement('td'); gd.colSpan=6; gd.textContent=`${g.label}（${list.length}名）`;
+    if(g.tip) gr.title=g.tip;
+    gr.appendChild(gd); tb.appendChild(gr);
+  }
+  for(const lg of list){
+    const p=byLogin.get(lg); if(!p) continue;
+    const w=workOf(lg);
+    nAll++; nW[w]++;
+    const tr=document.createElement('tr'); tr.className='w-'+w;
+    const td0=document.createElement('td'); td0.className='no'; td0.textContent=nAll;
+    const td1=document.createElement('td'); td1.className='nm'; td1.textContent=namekey(p.name);
+    const td2=document.createElement('td'); td2.className='ti'; td2.textContent=p.title||'';
+    if(p.unregistered){ const b=document.createElement('span'); b.className='badge-un'; b.textContent='手入力'; td2.appendChild(b);
+      tr.title='検索で見つからず、手で入れた医師です。そのままで大丈夫です（Dr.JOY への登録は事務担当がします。登録されると、この印は消えます）'; }
+    if(p.missing){ const b=document.createElement('span'); b.className='badge-un'; b.style.background='#c62828'; b.textContent='退職・異動？'; td2.appendChild(b);
+      tr.title=def?'Dr.JOY から外れた医師です（退職・異動など）。この月に貴科にいなければ × で外してください。まだ貴科にいる医師なら、事務担当に知らせてください'
+        :'Dr.JOY から外れた医師です（退職・異動など）。この月にこの当直に入らなければ × で外してください。まだ当直に入る医師なら、事務担当に知らせてください'; }
+    const td3=document.createElement('td');
+    // 区分の切り替え（20260927: フルタイム → パートタイム → 院外研修専従 → フルタイム）。
+    //   所属の申告にならない提出単位（集中治療室・内科・管理当直・内科C 初期研）では出さない
+    //   20261028 管理者: 決裁後も切り替えられる（庶務が貴科の医師リストを整え直す。割当は動かない）
+    //   20261028 管理者: 切り替えられるのは、その科の部門管理者（Dr.JOY の所属管理者・全体管理者）だけ
+    if(def&&!canRoster){
+      const kb=document.createElement('span'); kb.className='kubun locked k-'+w;
+      kb.textContent=WORK_LABEL[w];
+      kb.title=NOT_EDITOR_TIP;
+      td3.appendChild(kb);
+    }else if(def){
+      const kb=document.createElement('button'); kb.className='kubun k-'+w;
+      kb.textContent=WORK_LABEL[w];
+      kb.title=WORK_TIP[w];
+      kb.addEventListener('click',()=>{
+        setWork(lg,nextWork(workOf(lg)));
+        renderChips(); refresh();     // 未提出の変更として数える（閉じるときの確認・矢印。20260925）
+      });
+      td3.appendChild(kb);
+    }
+    const td4=document.createElement('td');
+    const x=document.createElement('button'); x.className='rm'; x.textContent='×';
+    x.title=def?'貴科の医師でなくなった（異動・退職・留学など）ときだけ外す。産休・育休・病休中や院外研修中は外さない':'名簿から外す';
+    // 20261028 管理者: 決裁後も、当直が1件も入っていない医師は外せる（庶務が「貴科の医師」を11月分へ整え直せるように。
+    //   割当は動かないので交代申請にはならない）。当直が入っている医師は、これまでどおり外せない
+    if(!canRoster&&savedMembers.has(lg)){ x.disabled=true; x.title=NOT_EDITOR_TIP; }
+    else if(locked&&savedMembers.has(lg)){
+      if(hasDutyIn(lg)){ x.disabled=true; x.title='決裁後は、当直が入っている医師は外せません（当直の交代はカレンダーで。所属が変わる医師は来月の名簿で）'; }
+      else x.title=def?'貴科の医師でなくなった（異動・退職・留学など）医師だけ外す。決裁後も、当直が入っていない医師は外せます':'名簿から外す。決裁後も、当直が入っていない医師は外せます'; }
+    if(x.disabled) x.textContent='－';   // 外せない医師は × でなく「－」（20261102 管理者: 赤い×と灰色の×では押せる方が分かりにくい）
+    x.addEventListener('click',()=>{
+      // 名簿から外す人の割当もカレンダーから外す（20260923: 名簿だけ外すと、見えない割当が提出されていた）
+      const keys=[...grid].filter(([,v])=>v.login===lg).map(([k])=>k);
+      if(keys.length&&!confirm(`${namekey(p.name)}医師の割当 ${keys.length} 件も外します。よろしいですか？`)) return;
+      for(const k of keys) grid.delete(k);
+      members=members.filter(v=>v!==lg); workMap.delete(lg); segMap.delete(lg); renderChips(); renderGrid(); refresh(); });
+    td4.appendChild(x);
+    if(comp){
+      const tdS=document.createElement('td'); tdS.className='sg';
+      if(canRoster){
+        const ss=document.createElement('select'); ss.className='segsel';
+        const auto=memberSegR(null,p.dept,pats), cur=segOf(lg);
+        if(!cur){ const o0=document.createElement('option'); o0.value=''; o0.textContent='どちら？'; ss.appendChild(o0); }
+        for(const t of pats){ const op=document.createElement('option'); op.value=t; op.textContent=segShort(t); ss.appendChild(op); }
+        ss.value=cur||'';
+        ss.title='この医師の「Dr.JOY所属」'+(auto?`（Dr.JOY では ${auto}）`:'');
+        ss.addEventListener('change',()=>{
+          // Dr.JOY の所属と同じなら持たない（Dr.JOY が正しく、別の所属を選んだときだけ所属の変更として知らせる）
+          if(!ss.value||ss.value===auto) segMap.delete(lg); else segMap.set(lg,ss.value);
+          renderChips(); renderGrid(); refresh();
+        });
+        tdS.appendChild(ss);
+      }
+      tr.append(td0,td1,td2,tdS,td3,td4);
+    }else tr.append(td0,td1,td2,td3,td4);
+    tb.appendChild(tr);
+  }
+  }
+  $('#memCount').innerHTML=def
+    ?`<b>${nAll}名</b>（フルタイム ${nW.full}・パートタイム ${nW.part}・院外研修専従 ${nW.ingai}）`
+    :`<b>${nAll}名</b>`;
+}
+// 貴科の医師リストの × と区分を、この PC の人が直せるか（20261028）。ブラウザで開いた見本では制限しない
+const NOT_EDITOR_TIP='医師を外すことと区分を変えることは、この科の部門管理者（庶務・部長）だけができます。変えたいときは、科の庶務の方に頼んでください';
+function rosterEditable(o){
+  if(!IS_APP) return true;
+  const r=cfg.rosterRights||{};
+  return canEditRosterR(o,r.editor||null,SHZ.owners,cfg.deptMap)&&!isReadOnly();
+}
+// 決裁前の月で、この PC の人がこの科の部門管理者でなければ見るだけ（20261028 管理者: 当直予定とメンバーを変えられるのは
+//   当直表を作る人だけ。決裁後の交代申請は誰でも出せる）
+const READONLY_MSG='この科の当直予定を入力・変更できるのは、この科の部門管理者（庶務・部長など、当直表を作る方）だけです。見ることはできます。';
+function isReadOnly(){
+  if(!IS_APP||!owner||cfg.confirmed) return false;
+  const r=cfg.rosterRights||{};
+  return !canEditR(owner,r.editor||null,cfg.deptMap);
+}
+function applyReadOnly(){
+  const ro=isReadOnly();
+  $('#addInput').disabled=ro;
+  $('#importBtn').disabled=ro;
+  if(!ro) return;
+  for(const el of document.querySelectorAll('#gridSec select,#gridSec button,#gridSec input,#shareBar button,#shareBar input')) el.disabled=true;
+  $('#submitBtn').disabled=true;
+}
+// ①の見出しと帯（20260927 管理者: この名簿が Dr.JOY の所属医師の申告になることを目立たせる）
+function renderShozokuHead(){
+  const def=isDefining(owner);
+  $('#memHeadSuffix').textContent=def?' ＝「Dr.JOY所属」の申告':'';
+  // 当直枠専用グループは「当直医のリスト」（20261105 管理者: 「貴科リスト」だと科の所属医師の表と紛れる）
+  $('#memHeadName').textContent=(owner&&!def)?'当直医のリスト':'貴科リスト';
+  $('#grpBadge').style.display=(owner&&!def)?'block':'none';
+  $('#hayamiBtn').style.display=(owner&&def)?'block':'none';   // 早見表は診療科のときだけ（20261106 管理者）
+  for(const el of document.querySelectorAll('.kikaOnly')) el.style.display=(owner&&!def)?'none':'';
+  for(const el of document.querySelectorAll('.grpOnly')) el.style.display=(owner&&!def)?'':'none';
+  const bn=$('#shozokuBanner');
+  bn.style.display=owner?'block':'none';
+  bn.className=def?'shzbanner':'shznote';
+  $('#helpShozoku').style.display=def?'':'none';   // 20261002: set before the early returns (it stayed visible when switching to 内科)
+  if(!owner){ bn.innerHTML=''; return; }
+  if(isReadOnly()){ bn.className='shznote'; bn.textContent=READONLY_MSG; return; }
+  if(cfg.confirmed){      // 決裁後（交代申請モード。20260927）
+    bn.className='shznote';
+    bn.innerHTML=(def&&!rosterEditable(owner))
+      ?'交代で入る医師は、下の検索欄から足せます。<br>医師を外すことと区分を変えることは、この科の部門管理者（庶務・部長）だけができます。'
+      :def?'決裁後も、区分の切り替えと、交代で入る医師の追加ができます。<br>この月に当直が無い医師は、貴科の医師でなくなっていれば × で外せます。'
+          :'決裁後も、交代で入る医師の追加ができます。<br>この月に当直が無い医師は、× で外せます。';
+    $('#helpShozoku').style.display=def?'':'none';
+    return;
+  }
+  if(!def){ bn.textContent='この当直に入る医師の一覧です（Dr.JOY の所属の申告にはなりません）'; return; }
+  const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  // 「Dr.JOY所属」の名前で言う（20261031 コードレビュー④: 集合当直は診療科ではない）
+  const pt=ownerPats(owner), segTxt=(pt.length?pt:[owner]).map(t=>`『${esc(t)}』`).join('と');
+  bn.innerHTML=`<div class="lead">この一覧が、「Dr.JOY所属」${segTxt}の所属医師になります。<br>当直に入らない医師も、貴科の医師は全員載せてください。`
+    +(isComposite(owner)?'<br>医師ごとに、どちらの「Dr.JOY所属」かを右の欄で確かめてください（Dr.JOY の所属から自動で入っています）。':'')+'</div>'
+    +(rosterEditable(owner)?'':'<div class="rmrule">医師を外すことと区分を変えることは、この科の部門管理者（庶務・部長）だけができます。</div>');   // Dr.JOY での入れ方は「この名簿について」だけに（20260927）
+  $('#helpShozoku').style.display=def?'':'none';
+}
+const addInput=$('#addInput'), addList=$('#addList');
+addInput.addEventListener('input',()=>{
+  const q=namekey(addInput.value);
+  addList.innerHTML=''; if(!q){ addList.style.display='none'; return; }
+  const qs=canon(q);
+  const qr=romajiToHira(addInput.value);      // ローマ字でも探す（IME がオフのまま。20260927）
+  const hits=cfg.roster.filter(p=>canon(p.name).includes(qs)||namekey(p.kana).includes(q)
+    ||(qr&&romajiHit(p.kana,qr)))
+    // 姓が打った文字で始まる医師を先に（ローマ字の「sato」で、名が「さとし」の医師より丙川医師を上に。20260927）
+    .sort((a,b)=>{ const sa=surnameFirst(a,q,qr), sb=surnameFirst(b,q,qr); return sa!==sb?sa-sb:cmpPerson(a,b); }).slice(0,30);
+  for(const p of hits){
+    const d=document.createElement('div');
+    // Dr.JOY の文字はそのまま文字として出す（innerHTML に入れない。20261009）
+    const sub=document.createElement('span'); sub.className='sub';
+    sub.textContent=`${p.title||p.job||''}／${String(p.dept||'').replace(/^\/|\/$/g,'')}`;
+    d.append(document.createTextNode(p.name||''),sub);
+    d.addEventListener('mousedown',()=>{
+      if(!members.includes(p.login)) members.push(p.login);
+      addInput.value=''; addList.style.display='none';
+      renderChips(); renderGrid(); refresh();
+    });
+    addList.appendChild(d);
+  }
+  if(q.length>=2){   // 名簿にない医師の手入力（Dr.JOY未登録。20260902ユーザー決定）
+    const d=document.createElement('div'); d.className='unreg';
+    d.textContent=`「${addInput.value.trim()}」を手入力で追加`;
+    d.addEventListener('mousedown',()=>{ openUnreg(addInput.value.trim()); addInput.value=''; addList.style.display='none'; });
+    addList.appendChild(d);
+  }
+  addList.style.display=addList.childNodes.length?'block':'none';
+});
+addInput.addEventListener('blur',()=>setTimeout(()=>addList.style.display='none',200));
+
+// ---- 名簿にない医師（Dr.JOY未登録）の手入力（20260902ユーザー決定）----
+// キー = 'unreg:' + 正規化氏名（異体字・空白を寄せる）。提出JSONには unregistered:true で載り、
+// 集約（contract.validate_submission）が氏名でDr.JOYの本人に結び付ける（未登録なら暫定のまま通す）。
+const unregLogin=name=>'unreg:'+canon(name);
+// いまの名簿（cfg.roster・毎日更新）に居ない人を byLogin に足す（20260923）。
+//   unreg: で始まる／unregistered … 名簿外（手入力）。それ以外 … 前回の提出や取込にはいるが、名簿から消えた医師（missing）。
+//   足しておかないと buildDuties が黙って落とし、次の提出でその割当が消えていた
+function ensurePerson(login,src){
+  if(!login||byLogin.has(login)) return;
+  const s=src||{};
+  const un=!!s.unregistered||String(login).startsWith('unreg:');
+  const name=s.name||(un?'':String(login).split('@')[0]);
+  if(!name) return;
+  byLogin.set(login,un
+    ?{login,code:'',name,kana:'',dept:'/（名簿外）/',title:s.title||'',doctor:true,unregistered:true}
+    :{login,code:s.code||'',name,kana:'',dept:'/（名簿に無い）/',title:s.title||'',doctor:true,missing:true});
+}
+function splitName(n){ const parts=String(n||'').trim().split(/[\s\u3000]+/); return [parts[0]||'', parts.slice(1).join('')]; }
+function similarPeople(name){
+  // 同姓同名(3) → 同じ姓(2) → 同じ名(1)。異体字・NFC・空白の揺れは canon で吸収
+  const full=canon(name); const [sei,mei]=splitName(name); const cs=canon(sei), cm=canon(mei);
+  const out=[];
+  for(const p of doctors){
+    const pc=canon(p.name); const [ps,pm]=splitName(p.name); const cps=canon(ps), cpm=canon(pm);
+    let sc=0;
+    if(pc===full) sc=3;
+    else if(cs&&cps===cs) sc=2;
+    else if(!cm&&full&&(pc.startsWith(full)||cps===full)) sc=2;   // 姓だけ入力
+    else if(cm&&cpm===cm) sc=1;
+    if(sc) out.push({p,sc});
+  }
+  out.sort((a,b)=>b.sc-a.sc||cmpPerson(a.p,b.p));
+  return out.slice(0,15);
+}
+function addUnreg(name,title){
+  const lg=unregLogin(name);
+  if(!byLogin.has(lg)) byLogin.set(lg,{login:lg,code:'',name:name,kana:'',dept:'/（名簿外）/',title:title||'',doctor:true,unregistered:true});
+  if(!members.includes(lg)) members.push(lg);
+  renderChips(); renderGrid(); refresh();
+}
+let unregShown=false;   // 候補を一度見せた後の「いいえ」で確定
+function openUnreg(q){
+  $('#unName').value=q||''; $('#unTitle').value='医師'; $('#unErr').textContent='';
+  $('#unCands').style.display='none'; $('#unCands').innerHTML=''; unregShown=false;
+  $('#unAdd').textContent='追加する';
+  $('#unregOv').style.display='flex'; setTimeout(()=>$('#unName').focus(),50);
+}
+$('#hayamiBtn').addEventListener('click',()=>{
+  $('#hayamiOv').style.display='flex'; $('#hayamiMsg').textContent='';
+  $('#hayamiSave').style.display=(window.td&&window.td.saveImage)?'':'none';
+});
+// 早見表を画像として保存（20261106 管理者）。表の部分（見出し〜注記）だけを写す。画面に入り切っていないと切れるので断る
+$('#hayamiSave').addEventListener('click',async()=>{
+  const md=$('#hayamiOv .modal'), cap=$('#hayamiCap'), msg=$('#hayamiMsg');
+  md.scrollTop=0;
+  await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+  const b=cap.getBoundingClientRect();
+  if(b.bottom>window.innerHeight||b.right>window.innerWidth||b.top<0||b.left<0){
+    msg.style.color='var(--ng)'; msg.textContent='表が画面に入り切っていません。窓を大きくするか「文字を元に」を押してから保存してください。'; return; }
+  msg.style.color='var(--muted)'; msg.textContent='';
+  const r=await window.td.saveImage({rect:{x:b.left,y:b.top,width:b.width,height:b.height},name:'早見表_当直表アプリ①貴科リスト.png'});
+  if(r&&r.ok){ msg.style.color='var(--ok)'; msg.textContent='保存しました: '+r.file; }
+  else if(r&&!r.canceled){ msg.style.color='var(--ng)'; msg.textContent='保存できませんでした: '+(r.error||''); }
+});
+$('#hayamiClose').addEventListener('click',()=>{ $('#hayamiOv').style.display='none'; });
+$('#hayamiOv').addEventListener('click',e=>{ if(e.target.id==='hayamiOv') $('#hayamiOv').style.display='none'; });
+function closeUnreg(){ $('#unregOv').style.display='none'; }
+$('#unCancel').addEventListener('click',closeUnreg);
+$('#unName').addEventListener('input',()=>{ unregShown=false; $('#unCands').style.display='none'; });
+$('#unAdd').addEventListener('click',()=>{
+  const name=$('#unName').value.trim().replace(/\u3000/g,' ').replace(/\s+/g,' ');
+  const title=$('#unTitle').value;
+  if(!name){ $('#unErr').textContent='氏名を入れてください'; return; }
+  if(!name.includes(' ')) { $('#unErr').textContent='姓と名の間に空白を入れてください（例: 見本 太郎）'; return; }
+  // = + - @ で始まる文字は Excel が数式として扱う（当直表の Excel に書き出したときに誤作動する）ので受け付けない（20260925）
+  if(/^[=+\-@＝＋－＠]/.test(name)){ $('#unErr').textContent='氏名は「= + - @」で始められません。氏名だけを入れてください'; return; }
+  $('#unErr').textContent='';
+  const already=byLogin.get(unregLogin(name));
+  if(already&&already.unregistered){ addUnreg(name,title); closeUnreg(); return; }
+  const cands=similarPeople(name);
+  if(cands.length&&!unregShown){
+    unregShown=true;
+    const box=$('#unCands'); box.innerHTML='';
+    const qd=document.createElement('div'); qd.className='q'; qd.textContent='この医師ではありませんか？（名簿に同じ姓・名の人がいます）'; box.appendChild(qd);
+    for(const {p,sc} of cands){
+      const row=document.createElement('div'); row.className='cand';
+      const nm=document.createElement('span'); nm.textContent=p.name;
+      const how=document.createElement('span'); how.className='how';
+      how.textContent=`${sc===3?'同姓同名':sc===2?'同じ姓':'同じ名'}／${p.title||''}／${String(p.dept||'').replace(/^\/|\/$/g,'')}`;
+      const b=document.createElement('button'); b.className='btn'; b.textContent='この人です';
+      b.addEventListener('click',()=>{ if(!members.includes(p.login)) members.push(p.login);
+        closeUnreg(); renderChips(); renderGrid(); refresh(); });
+      row.append(nm,how,b); box.appendChild(row);
+    }
+    const no=document.createElement('div'); no.className='msg'; no.style.marginTop='8px';
+    no.textContent='どれでもなければ、もう一度「追加する」を押すと、手入力で追加します。';
+    box.appendChild(no);
+    box.style.display='block';
+    $('#unAdd').textContent='いいえ、手入力で追加する';
+    return;
+  }
+  addUnreg(name,title); closeUnreg(); $('#unAdd').textContent='追加する';
+});
+
+// ---- ② calendar（月曜はじまり・週=行。2026-08-30ユーザーフィードバック）----
+const WD=['月','火','水','木','金','土','日'];
+// targets = [{f,band}] 書込先（昼夜共通セルは2本=昼と夜、通常セルは1本）。
+// データは常に昼/夜の2本で持ち、共通セルは「同じ内容を両方に書く」だけの見せ方。
+function slotRow(targets,d,s){
+  const keys=targets.map(t=>`${t.f.frame_id}|${d.date}|${t.band}|${s}`);
+  const cur=grid.get(keys[0])||{};
+  const div=document.createElement('div'); div.className='slot';
+  const sel=document.createElement('select');
+  const o0=document.createElement('option'); o0.value=''; o0.textContent='―'; sel.appendChild(o0);
+  // 集合当直の中の1科の枠（内科C 血液神経の脳神経など）では、その科の医師を先に、ほかの所属の医師を後ろにまとめる。
+  //   応援は実際にあるので止めない（入れると注意の色。20261031 コードレビュー⑤）
+  const fp=framePatsOf(targets[0].f);
+  const xd=lg=>isCrossDept(segOf(lg),fp);
+  const optOf=lg=>{ const p=byLogin.get(lg);
+    const op=document.createElement('option'); op.value=lg; op.textContent=namekey(p.name)+(p.unregistered?'（手入力）':p.missing?'（退職・異動？）':'')   /* 左の名簿の印（手入力／退職・異動？）と同じ */; return op; };
+  const shown=members.filter(lg=>byLogin.has(lg));
+  for(const lg of shown) if(!xd(lg)) sel.appendChild(optOf(lg));
+  const others=shown.filter(xd);
+  if(others.length){
+    const og=document.createElement('optgroup'); og.label='ほかの「Dr.JOY所属」の医師（応援）';
+    for(const lg of others) og.appendChild(optOf(lg));
+    sel.appendChild(og);
+  }
+  sel.value=cur.login||'';
+  // 必須=ファースト帯（f-*・直近実績あり）または当番当直の欄の1人目。runChecks の未入力判定と同じ条件
+  //   （20260926: 当番当直の欄は実績に依らず必須。例 12/29 の泌尿器科の昼）
+  const required=s===0&&targets.some(t=>isRequiredBand(t.f,d.date,t.band,isToban));
+  const paintSel=()=>{ sel.classList.toggle('filled',!!sel.value); sel.classList.toggle('req-empty',required&&!sel.value); };
+  paintSel();
+  // 当番当直の欄はグレー地に白字（20260925 管理者。昼夜共通の欄は昼・夜のどちらかが当番なら）
+  if(targets.some(t=>isToban(t.f,d.date,t.band))) sel.classList.add('tb');
+  // 決裁のときから変わったか（決裁済みの月だけ）: 入っている人が決裁のときに居ない・当/オが違う → 赤字。
+  //   空いた欄は、決裁のときに居た人がいまこのマスに居なければ赤枠（取り止め・交代で抜けた）
+  const cks=[...new Set(keys.map(k=>k.split('|').slice(0,3).join('|')))];
+  let oncallNow=()=>false;
+  // idx（'枠|日|昼夜'→Map）と比べて、この欄の人が違うか・この欄が空で抜けた人がいるか
+  const diffFrom=(idx)=>{
+    const lg=sel.value;
+    let changed=false, gone=false;
+    for(const ck of cks){
+      const b=idx.get(ck)||new Map();
+      if(lg&&(!b.has(lg)||b.get(lg)!==oncallNow())) changed=true;
+      if(!lg){ const cur=cellLogins(ck); for(const x of b.keys()) if(!cur.has(x)) gone=true; }
+    }
+    return [changed,gone];
+  };
+  const paintChg=()=>{
+    const [chg,gone]=baseIdx?diffFrom(baseIdx):[false,false];
+    const [pend,pgone]=savedIdx?diffFrom(savedIdx):[false,false];
+    sel.classList.toggle('chg',chg); sel.classList.toggle('chg-empty',gone);
+    sel.classList.toggle('pend',pend); sel.classList.toggle('pend-empty',pgone);
+    // 同じ人がこのマスのほかの欄にも入っている（20260926: 提出できない。runChecks の kind:'dup' と同じ判定）
+    const dup=!!sel.value&&cks.some(ck=>countInCell(ck,sel.value)>1);
+    sel.classList.toggle('dup',dup);
+    const cross=!!sel.value&&xd(sel.value);
+    sel.classList.toggle('xdept',cross);
+    const tips=[];
+    if(dup) tips.push('同じ人がこのマスに2回入っています。どちらかを外してください');
+    if(cross) tips.push(`「Dr.JOY所属」が${segOf(sel.value)}の医師です。応援なら、このままで大丈夫です`);
+    if(pend||pgone) tips.push('たった今変えたところ（まだ提出していません）');
+    if(chg) tips.push('決裁のときから変わったところ（交代申請）');
+    else if(gone) tips.push('決裁のときに入っていた人が抜けた（交代申請）');
+    sel.title=tips.join('／');
+  };
+  for(const ck of cks){ if(!chgPainters.has(ck)) chgPainters.set(ck,[]); chgPainters.get(ck).push(paintChg); }
+  // 既定の当/オ: frames.json の duty_slots（先頭n行=当）があればそれに従う（第18版・実績由来）。
+  // 無ければ従来どおり oncall_default
+  const dutyN=Math.max(...targets.map(t=>t.f.duty_slots??-1));
+  let oncall=cur.oncall!==undefined?cur.oncall:(dutyN>=0?s>=dutyN:!!targets[0].f.oncall_default);
+  // 管理当直: 名簿でオンコールの印がある部長を選んだら最初から「オ」（管理者 20260923）
+  const fxOc=new Map(((cfg.fixedMembers||{})[owner]||[]).map(x=>[x.login,!!x.oncall]));
+  const tg=document.createElement('button');
+  const paint=()=>{ tg.textContent=oncall?'オ':'当'; tg.className='tg '+(oncall?'oc':'duty'); };
+  paint();
+  oncallNow=()=>oncall;
+  paintChg();
+  tg.title='クリックで切替: 当=当直（泊まる）／オ=オンコール（泊まらない・呼び出し待機）';
+  sel.addEventListener('change',()=>{
+    if(sel.value&&fxOc.has(sel.value)){ oncall=fxOc.get(sel.value); paint(); }
+    for(const k of keys){
+      if(sel.value) grid.set(k,{login:sel.value,oncall});
+      else grid.delete(k);
+    }
+    paintSel();
+    repaintCells(cks);
+    refresh();
+  });
+  tg.addEventListener('click',()=>{
+    oncall=!oncall; paint();
+    for(const k of keys) if(grid.has(k)) grid.get(k).oncall=oncall;
+    repaintCells(cks);
+    refresh();
+  });
+  div.appendChild(sel); div.appendChild(tg);
+  return div;
+}
+// セル内の枠表示: 科を選んで開いている画面なので科名は繰り返さない（2026-08-30フィードバック）。
+// ラベルは枠自身のroleで決める: first=「ファースト」/second=「セカンド以下」。
+// ownerが片ロールしか持たなくてもそのまま出す（「当直」はroleが本当に無い枠だけ）。
+// 複数の科名の枠を持つownerは誤読防止で正式ラベルのまま。ツールチップに正式枠名を残す。
+// 管理当直の枠（dept=管理当直・role=first）は「ファースト」ではなく「管理当直」と出す（管理者 20260923）
+function roleDisp(f){ if(f.dept==='管理当直') return '管理当直'; return f.role==='first'?'ファースト':(f.role==='second'?'セカンド以下':'当直'); }
+// 正式な枠名（ツールチップ用。同じ科名でファースト/セカンド両枠があるときだけ役割を付ける）。
+// 20260912 の xlsx一本化でテンプレ書き出しと一緒に消えていたが、frameDisp と unitBlock が使っている（20260914 復旧）
+const ROLE_LABEL_FALLBACK={first:'（ファースト）',second:'（セカンド以下）'};
+function frameLabel(f){
+  const nk=typeof namekey==='function'?namekey:(s=>String(s||'').replace(/\s+/g,''));
+  const rl=typeof ROLE_LABEL!=='undefined'?ROLE_LABEL:ROLE_LABEL_FALLBACK;
+  const dup=(ownFrames||[]).some(x=>x!==f&&nk(x.dept)===nk(f.dept)&&x.role!==f.role);
+  return f.dept+(dup?(rl[f.role]||''):'');
+}
+function frameDisp(f){
+  const depts=new Set(ownFrames.map(x=>namekey(x.dept)));
+  if(depts.size>1) return frameLabel(f);
+  return roleDisp(f);
+}
+// unit = 表示ブロック1個: {targets:[{f,band}], shared:bool}
+//   shared=true は昼夜共通セル（バッジ「昼夜」・1回の入力が昼と夜の両方に保存される）。
+// 当番当直（20260922 管理者）: config.toban = [{date,band,dept}]（DTX14「当番当直」シート由来・科名は dept_dtx14）。
+//   その科のファーストの欄に赤字で「当番当直」と出し、オンコールにしていたら提出できない（当直が必須）。
+function isToban(f,date,band){
+  if(f.role!=='first'||!cfg.toban) return false;
+  const k=namekey(f.dept_dtx14||f.dept);
+  return cfg.toban.some(t=>t.date===date&&t.band===band&&namekey(t.dept)===k);
+}
+// 開院記念日などの昼は当番当直も含めて全員オンコール（管理者 20260922）→ その昼だけ「オンコール不可」を免除
+function tobanMustDuty(f,date,band){
+  if(!isToban(f,date,band)) return false;
+  const d=cfg.days.find(x=>x.date===date);
+  return !(band==='昼'&&d&&d.daytimeOncallOnly);
+}
+function unitBlock(u,d,maxSlot){
+  const f0=u.targets[0].f;
+  const box=document.createElement('div'); box.className='fblock';
+  const lab=document.createElement('div');
+  lab.className='flabel '+(f0.role==='first'?'fl-first':'fl-second');
+  const eff=u.shared?'昼夜':u.targets[0].band;
+  // 語順はバンド→役割（「夜 ファースト」。20260831ユーザー指示）
+  lab.innerHTML=`<span class="shape s${eff}">${eff}</span>${frameDisp(f0)}`;
+  lab.title=`${frameLabel(f0)}／${roleDisp(f0)}`
+    +(f0.no_permit?'・宿日直許可なし':'')
+    +(u.targets.some(t=>isToban(t.f,d.date,t.band))?'・当番当直（この日の当直の要。オンコールでは提出できません）':'')
+    +(u.shared?'・昼夜共通（1回の入力が昼と夜の両方に保存されます。別々に入れるときはスイッチをOFF）':'');
+  box.appendChild(lab);
+  if(u.targets.some(t=>isToban(t.f,d.date,t.band))){ const tb=document.createElement('div'); tb.className='toban'; tb.textContent='当番当直'; tb.title='この日の当直の要。オンコールでは提出できません'; box.appendChild(tb); }
+  // 既定の行数 = duty_slots+oncall_slots（現物DTX14の最大人数・第18版）。無ければ capacity
+  const defN=Math.max(...u.targets.map(t=>t.f.duty_slots!==undefined?(t.f.duty_slots||0)+(t.f.oncall_slots||0):(t.f.capacity||1)));
+  let n=Math.max(defN,1,...u.targets.map(t=>(maxSlot.get(`${t.f.frame_id}|${d.date}|${t.band}`)??-1)+1));
+  for(let s=0;s<n;s++) box.appendChild(slotRow(u.targets,d,s));
+  if(f0.role!=='first'){  // ファーストは必ず1人=追加ボタンなし（2026-08-30フィードバック）
+    const add=document.createElement('button'); add.className='addoc'; add.textContent='追加';
+    add.title='この枠にもう1人追加（追加後に 当/オ で切り替えられます）';
+    add.addEventListener('click',()=>{ box.insertBefore(slotRow(u.targets,d,n),add); n++;
+      requestAnimationFrame(()=>{ const tb=document.querySelector('table.cal tbody');
+        if(tb) alignBandRows(tb); }); });   // 行の高さ揃えを追随
+    box.appendChild(add);
+  }
+  return box;
+}
+function renderGrid(){
+  const wrap=$('#gridwrap'); wrap.innerHTML='';
+  chgPainters.clear();
+  if(!owner) return;
+  const tbl=document.createElement('table'); tbl.className='cal';
+  const thead=document.createElement('thead'); const hr=document.createElement('tr');
+  for(const w of WD){
+    const th=document.createElement('th');
+    th.className=w==='日'?'sun':(w==='土'?'sat':'');
+    th.textContent=w; hr.appendChild(th);
+  }
+  thead.appendChild(hr); tbl.appendChild(thead);
+  // 取込・＋オでcapacityを超えたスロットに入った分まで描く（キーは 枠|日|バンド）
+  const maxSlot=new Map();
+  for(const key of grid.keys()){ const [fid,date,band,s]=key.split('|'); const k=`${fid}|${date}|${band}`;
+    maxSlot.set(k,Math.max(maxSlot.get(k)??-1,+s)); }
+  // 週へ分割（月曜はじまり。月初の前月部分・月末の翌月部分は灰色の空マス）
+  const weeks=[]; let week=new Array(7).fill(null);
+  for(const d of cfg.days){
+    const wi=WD.indexOf(d.weekday);
+    week[wi]=d;
+    if(wi===6){ weeks.push(week); week=new Array(7).fill(null); }
+  }
+  if(week.some(x=>x)) weeks.push(week);
+  const tb=document.createElement('tbody');
+  for(const wk of weeks){
+    const tr=document.createElement('tr');
+    for(const d of wk){
+      const td=document.createElement('td');
+      if(!d){ td.className='na'; tr.appendChild(td); continue; }
+      td.dataset.date=d.date;
+      // holiday=土日祝すべてtrue（contractの非稼働日）。土曜は祝日名が無ければ青系(sat)、
+      // 日曜と祝日は赤系(hol)＝見出し行の色分けと揃える（第18版）
+      const dcls=(d.weekday==='日'||d.holidayName)?' hol':(d.weekday==='土'?' sat':'');
+      if(dcls) td.classList.add(dcls.trim());
+      const dh=document.createElement('div');
+      dh.className='dayhead'+dcls;
+      dh.innerHTML=`<span class="dn">${d.day}</span>`+(d.holidayName?`<span class="hn">${d.holidayName}</span>`:'');
+      td.appendChild(dh);
+      // セルの中身を「表示ブロック(unit)」に組む（20260831昼夜分離）:
+      //   昼夜共通スイッチONのグループで昼と夜の両方がある日 → 共通セル1個（書込先=昼+夜）
+      //   それ以外 → 枠×バンドごとに別セル（全日枠のOFFは土日祝が昼セル+夜セルに割れる）
+      const units=[]; const sharedFids=new Set();
+      for(const g of shareGroups){
+        if(!share.get(g.key)) continue;
+        const m=groupBands(g.frames,d);
+        if(m&&m['昼']&&m['夜']){
+          units.push({shared:true,targets:[{f:m['昼'],band:'昼'},{f:m['夜'],band:'夜'}]});
+          for(const f of g.frames) sharedFids.add(f.frame_id);
+        }
+      }
+      for(const f of ownFrames){
+        if(!applicable(f,d)||sharedFids.has(f.frame_id)) continue;
+        for(const b of bandsOf(f,d)) units.push({shared:false,targets:[{f,band:b}]});
+      }
+      // セル内の並び: バンド優先（昼F→昼S→夜F→夜S）。昼夜共通セルは最後に置く
+      // （2026-08-30フィードバック=ファースト昼と夜の間に別枠が割り込むと読みにくい、の維持）。
+      // 同バンド内は役割（ファースト→セカンド以下→その他）→ frames.jsonのorder。
+      const bandK=u=>u.shared?2:(u.targets[0].band==='昼'?0:1);
+      const roleK=u=>{const r=u.targets[0].f.role; return r==='first'?0:(r==='second'?1:2);};
+      const ordK=u=>Math.min(...u.targets.map(t=>t.f.order??0));
+      units.sort((a,b)=>bandK(a)-bandK(b)||roleK(a)-roleK(b)||ordK(a)-ordK(b));
+      // バンドごとの入れ物（bb0=昼 / bb1=夜 / bb2=昼夜共通）。bb0は空でも置き
+      // alignBandRowsで行内の最大高さに揃える=平日（昼なし）の夜ブロックが土日祝の
+      // 夜ブロックと同じ高さに下がる。bb1/bb2は詰め物をせず連続に流す（第13版）
+      const boxes=[0,1,2].map(i=>{const bx=document.createElement('div');
+        bx.className='bb bb'+i; td.appendChild(bx); return bx;});
+      for(const u of units){ const bx=boxes[bandK(u)];
+        bx.appendChild(unitBlock(u,d,maxSlot)); bx.classList.add('bbfilled'); }
+      tr.appendChild(td);
+    }
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb); wrap.appendChild(tbl);
+  alignBandRows(tb);
+}
+// 週の行ごとにブロックの縦位置を揃える（20260831 第13版で見直し）:
+//   昼段(bb0)だけを行内の最大高さに揃え、夜(bb1)と昼夜共通(bb2)は間に詰め物をせず
+//   連続に流す。→ 夜段の始まりが行内で一致し、昼夜共通スイッチONの土日祝では
+//   共通ブロックが「その手前の夜ブロックの直後」= 平日の同じ枠の夜ブロックと同じ
+//   縦位置に来る（例: F昼/F夜+S共通の科なら、平日=F夜,S夜 / 土日祝=F夜,S共通 が同じ高さ）。
+//   第12版は bb1/bb2 にも行内最大の詰め物をしたため、ONのとき土日祝の共通ブロックが
+//   （空のbb1のぶん）夜段の下へ落ちて平日の夜ブロックと揃わなかった。
+function alignBandRows(tb){
+  for(const e of tb.querySelectorAll('.bb,.dayhead')) e.style.minHeight='';  // 再実行時に前回値で膨らむのを防ぐ
+  for(const tr of tb.querySelectorAll('tr')){
+    // 日付見出しも行内で揃える（祝日名が折り返すセルだけ下がるのを防ぐ）
+    for(const cls of ['dayhead','bb0']){
+      const els=[...tr.querySelectorAll('.'+cls)];
+      if(!els.length) continue;
+      const h=Math.max(...els.map(e=>e.offsetHeight));
+      if(h>0) for(const e of els) e.style.minHeight=h+'px';
+    }
+  }
+}
+
+// ---- duties（原子レコード）の組み立て: マスのキーが既に昼/夜なのでそのまま1本ずつ出す ----
+function buildDuties(){
+  const out=[];
+  for(const [key,v] of grid){
+    const [fid,date,band]=key.split('|');
+    const f=ownFrames.find(x=>x.frame_id===fid); if(!f||!v.login) continue;
+    const p=byLogin.get(v.login); if(!p) continue;
+    out.push({schema:'hospital.duty/1',staff_login:p.login,staff_code:p.code,name:p.name,
+      name_disp:namekey(p.name),date:date,band:band,frame_dept:f.dept,frame_id:f.frame_id,
+      role:f.role,oncall:!!v.oncall,note:'',...(p.unregistered?{unregistered:true}:{})});
+  }
+  return out;
+}
+
+// ---- ③ checks ----
+function runChecks(){
+  const errs=[],warns=[];
+  // 必須: ファースト帯（f-*・直近実績あり）と当番当直の欄の未入力。バンド（昼/夜）ごとに見る
+  //   20260926: 当番当直の欄は実績（used_2026_09）に依らず必須（例 12/29 の泌尿器科の昼）。
+  //   開院記念日の昼は当番当直もオンコールでよい（tobanMustDuty）が、空のままは不可＝ここは isToban で見る
+  for(const f of ownFrames){
+    for(const d of cfg.days){
+      if(!applicable(f,d)) continue;
+      for(const b of bandsOf(f,d)){
+        if(!isRequiredBand(f,d.date,b,isToban)) continue;
+        let any=false;
+        const pre=`${f.frame_id}|${d.date}|${b}|`;
+        for(const key of grid.keys()) if(key.startsWith(pre)){ any=true; break; }
+        if(!any) errs.push({dates:[d.date],msg:`${d.day}日(${d.weekday}) 〔${b}〕${frameDisp(f)} が未入力です`});
+      }
+    }
+  }
+  // 必須: 当番当直の日はオンコール不可（20260922 管理者。当直が必須）
+  for(const [key,v] of grid){
+    if(!v.oncall) continue;
+    const [fid,date,band]=key.split('|');
+    const f=ownFrames.find(x=>x.frame_id===fid);
+    if(f&&tobanMustDuty(f,date,band)){
+      const d=cfg.days.find(x=>x.date===date)||{day:+date.slice(8,10),weekday:''};
+      errs.push({kind:'toban',dates:[date],msg:`${d.day}日(${d.weekday}) 〔${band}〕${frameDisp(f)} は当番当直です。オンコールにはできません（当直にしてください）`});
+    }
+  }
+  // 必須: 同じ人が同じマス（枠×日×昼夜）に2回入っていない（20260926。当とオで2回など。どちらが正か分からないので出させない）
+  for(const {ck,login} of dupInCells(grid)){
+    const [fid,date,band]=ck.split('|');
+    const f=ownFrames.find(x=>x.frame_id===fid); if(!f) continue;
+    const d=cfg.days.find(x=>x.date===date)||{day:+date.slice(8,10),weekday:''};
+    const p=byLogin.get(login);
+    errs.push({kind:'dup',dates:[date],msg:`${d.day}日(${d.weekday}) 〔${band}〕${frameDisp(f)}: 同じ人が2回入っています（${p?namekey(p.name):login}）`});
+  }
+  // 警告: 当直（泊まる）が枠の定員超（バンドごと。オンコールは複数人が正常なので数えない）
+  const dutyCnt=new Map();
+  for(const [key,v] of grid){
+    if(v.oncall) continue;
+    const [fid,date,band]=key.split('|');
+    const k=`${fid}|${date}|${band}`;
+    dutyCnt.set(k,(dutyCnt.get(k)||0)+1);
+  }
+  for(const [k,c] of dutyCnt){
+    const [fid,date,band]=k.split('|');
+    const f=ownFrames.find(x=>x.frame_id===fid);
+    if(f&&c>(f.capacity||1))
+      warns.push({dates:[date],msg:`${+date.slice(8,10)}日 〔${band}〕${frameDisp(f)}: 「当」（泊まる当直）が${c}名います（枠の定員${f.capacity||1}名。連名でなければ「オ」に切り替えてください）`});
+  }
+  // 警告: 同じ人が同じ日に複数枠 / 連続当直
+  //   「枠」は 科名×役割 で数える（昼と夜が別の枠 ID になっている科＝救急科など でも、同じ人の昼＋夜は1つ。
+  //   20260914 ユーザー指摘: 昼夜の話で大量に警告が出ていた）
+  const byPD=new Map();
+  const unitOf=fid=>{ const f=ownFrames.find(x=>x.frame_id===fid); return f?`${f.dept}|${f.role}`:fid; };
+  for(const [key,v] of grid){
+    const [fid,date]=key.split('|');
+    const k=`${v.login}|${date}`;
+    (byPD.get(k)||byPD.set(k,new Set()).get(k)).add(unitOf(fid));
+  }
+  for(const [k,s] of byPD){ if(s.size>1){ const [lg,date]=k.split('|'); const p=byLogin.get(lg);
+    warns.push({dates:[date],msg:`${p?namekey(p.name):lg} が ${+date.slice(8,10)}日 に複数の枠に入っています（併任なら正当）`}); } }
+  // 連続当直は「当」（泊まる当直）だけで見る。オンコールの連続は正常（20260914 ユーザー決定）。
+  // 出す科は枠マスタの consecutive_warn_owners（config の consecutiveWarnOwners。20260914: 救急科と小児科だけ）。
+  // 20261025: 夜の当直の翌日の当直は提出できない（consecutiveChecks）
+  if((cfg.consecutiveWarnOwners||[]).includes(owner)){
+    const ds=[...grid].map(([key,v])=>{ const [,date,band]=key.split('|'); return {login:v.login,date,band,oncall:v.oncall}; });
+    const cc=consecutiveChecks(ds,cfg.days,lg=>{ const p=byLogin.get(lg); return p?namekey(p.name):lg; });
+    errs.push(...cc.errs); warns.push(...cc.warns);
+  }
+  return {errs,warns};
+}
+// ---- 未提出の変更（20260922 管理者指示）----
+//   「きれいな状態」= 科を選んで前回の提出を復元した直後、または保存が成功した直後の入力内容。
+//   そこから buildDuties/名簿/勤務区分 が変わっていれば dirty。矢印を点滅させ、main にも伝える
+//   （閉じるときに「提出ボタンが押されていません」と確認するため）。昼夜共通スイッチだけの
+//   切替はデータ不変なので dirty にならない。
+let cleanSnap=null, lastDirty=false;
+// 割当は並び順に依らずに比べる（昼夜共通の並べ直し＝normalizeShare は中身を変えないので dirty にしない。20260925）
+//   20260927: 区分（フルタイム以外）も比べる＝区分の切り替えも未提出の変更
+function snapState(){ return JSON.stringify({d:buildDuties().map(x=>JSON.stringify(x)).sort(),m:members,
+  o:members.filter(lg=>workOf(lg)!=='full').map(lg=>lg+'|'+workOf(lg)).sort(),
+  s:members.filter(lg=>segToSave(lg)).map(lg=>lg+'|'+segToSave(lg)).sort()}); }
+// 保存済みの名簿（決裁後に × を許すのは、この画面で足したばかりの医師だけ。20260927）
+let savedMembers=new Set();
+// この月に保存（提出・申請）した名簿の区分（提出の確認の「区分が変わる」の比べる相手。無ければ null。20260927）
+let hasSaved=false, savedWork=null;
+function markClean(){ cleanSnap=owner?snapState():null; savedIdx=owner?gridIdx():null;
+  savedWork=(owner&&hasSaved)?new Map(members.map(lg=>[lg,workOf(lg)])):null;
+  savedMembers=new Set(owner?members:[]); savedDuties=owner?buildDuties():[]; repaintAll(); }
+// 最後に保存（提出・交代申請）した割当。交代申請の確認に「誰から誰へ」を出す相手（20260927）
+let savedDuties=[];
+function isDirty(){ return !!owner&&cleanSnap!==null&&snapState()!==cleanSnap; }
+// 点滅する矢印を提出（交代申請）ボタンの真上に置く。ボタンの文字で幅が変わるので、毎回ボタンを測る（20260925 管理者「矢印がずれてる」）
+function placeArrow(){
+  const a=$('#dirtyArrow'), btn=$('#submitBtn'), ft=$('#footer');
+  if(!a||!btn||!ft) return;
+  const fr=ft.getBoundingClientRect(), br=btn.getBoundingClientRect();
+  if(!br.width) return;
+  a.style.width=br.width+'px';
+  a.style.right=(fr.right-br.right)+'px';
+}
+window.addEventListener('resize',placeArrow);
+function refreshDirty(){
+  const dirty=isDirty();
+  $('#footer').classList.toggle('dirty',dirty);
+  if(dirty) placeArrow();
+  if(dirty!==lastDirty){ lastDirty=dirty; if(IS_APP&&window.td.setDirty) window.td.setDirty(dirty); }
+}
+function refresh(){
+  const sum=$('#chkSummary'); sum.textContent=''; sum.title=''; sum.className='msg';
+  refreshDirty();
+  if(!owner){ $('#submitBtn').disabled=true; return; }
+  const {errs,warns}=runChecks();
+  const n=grid.size;
+  sum.className='msg '+(errs.length?'err':'ok');
+  const nTb=errs.filter(e=>e.kind==='toban').length, nDup=errs.filter(e=>e.kind==='dup').length,
+        nIv=errs.filter(e=>e.kind==='interval').length, nEmp=errs.length-nTb-nDup-nIv;
+  const parts=[];
+  if(nEmp) parts.push(`未入力 ${nEmp} 件`);
+  if(nTb) parts.push(`当番当直がオンコール ${nTb} 件`);
+  if(nDup) parts.push(`同じ人が2回 ${nDup} 件`);
+  if(nIv) parts.push(`夜の当直の翌日も当直 ${nIv} 件`);
+  sum.textContent=errs.length?`⚠ ${parts.join('・')}（${cfg.confirmed?'申請':'提出'}できません）`:`✓ 入力 ${n} 件（昼・夜は別々に数えます）。${cfg.confirmed?'申請':'提出'}できます`;
+  if(warns.length) sum.textContent+=`　△ 警告 ${warns.length} 件`;
+  // 明細は目立たせない（第18版ユーザー指示）。フッターの件数にツールチップで残すだけ
+  sum.title=[...errs,...warns].map(x=>x.msg).join('\n');
+  $('#submitBtn').disabled=errs.length>0||n===0;
+  $('#footErr').textContent='';
+  applyReadOnly();
+}
+
+// ---- Excelに書き出す / 取り込む ----
+//   xlsx の意匠も読取規則も Python の CLI ヘルパー（tools/touchoku_xlsx.py）が正本。
+//   このアプリは xlsx を直に触らない。
+
+// 画面の割当とメンバーを、ヘルパーに渡す形（draft）にする
+//   20260926: 対象月でない月は duties を付けない（makeDraft）。ヘルパーがその月の共有の予定から書き出す
+function buildDraft(year,month){
+  const roster=members.map(lg=>rosterEntryOf(byLogin.get(lg),workOf(lg),segToSave(lg)));
+  return makeDraft(owner,year,month,roster,year===cfg.year&&month===cfg.month,buildDuties);
+}
+
+$('#tplDlBtn').addEventListener('click',()=>{
+  if(!owner){ alert('先に科を選んでください'); return; }
+  const sel=$('#ymSel'); sel.innerHTML='';
+  for(let d=-6;d<=6;d++){                       // 前後半年から選ぶ
+    const t=new Date(cfg.year,cfg.month-1+d,1);
+    const y=t.getFullYear(),m=t.getMonth()+1;
+    const o=document.createElement('option');
+    o.value=`${y}-${String(m).padStart(2,'0')}`;
+    o.textContent=`R${y-2018}年${m}月`+(d===0?'（この月）':'');
+    if(d===0) o.selected=true;
+    sel.appendChild(o);
+  }
+  $('#ymOv').style.display='flex';
+});
+$('#ymNo').addEventListener('click',()=>$('#ymOv').style.display='none');
+$('#ymYes').addEventListener('click',async()=>{
+  $('#ymOv').style.display='none';
+  const ym=$('#ymSel').value, [y,m]=ym.split('-').map(Number);
+  const name=`当直表_R${y-2018}年${m}月_${owner}.xlsx`.replace(/[\/:*?"<>|]/g,'・').replace(/[ 　]/g,'');
+  const r=await window.td.exportXlsx({owner,ym,name,draft:buildDraft(y,m)});
+  if(r&&r.ok) alert('書き出しました:\n'+r.file);
+  else if(r&&!r.canceled) alert('書き出せませんでした: '+r.error);
+});
+
+let pendingImport=null, pendingOther=null;
+// 違う月の Excel: 書き出したあと、その月のこの科の予定が変わったか（20260925）。
+//   _メタ の master_rev（書き出したときのこの科の rev。その科の予定が無ければ空）と、いまの rev を比べる。
+//   master_rev の項目が無い古い Excel は、書き出した時刻（generated）といまの updated を比べる。どちらも無ければ「変わった」とみなす
+function changedSinceExport(meta,ent){
+  if(!ent) return false;                       // この科の予定がまだ無い＝上書きで失うものは無い
+  const has=Object.prototype.hasOwnProperty.call(meta,'master_rev'), mr=meta.master_rev;
+  if(has&&mr!==null&&mr!==''&&Number.isFinite(Number(mr))) return Number(ent.rev||0)>Number(mr);
+  if(has) return true;                         // 書き出したときは予定が無かった → そのあとに誰かが出した
+  const gen=String(meta.generated||'').replace(' ','T'), up=String(ent.updated||'').replace(' ','T');
+  if(gen&&up) return up>gen;
+  return true;
+}
+function fmtStamp(s){
+  const m=String(s||'').match(/^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)/);
+  return m?`${+m[2]}月${+m[3]}日 ${+m[4]}時${m[5]}分`:String(s||'');
+}
+async function doImport(droppedPath){
+  if(!owner){ alert('先に科を選んでください'); return; }
+  // droppedPath があればドラッグ＆ドロップ（20260914 ユーザー指示）。無ければファイル選択ダイアログ
+  const r=droppedPath?await window.td.importXlsxPath(droppedPath):await window.td.importXlsx();
+  if(!r||r.canceled) return;
+  if(!r.ok){ alert('読み込めませんでした: '+r.error); return; }
+  const res=r.result||{};
+  const rejects=res.rejects||[], changes=res.changes||[], duties=res.duties||[];
+  // 注意（20260926: ヘルパーの warnings[]。当直の定員超など）。取り込みは止めず、△ の行で知らせるだけ
+  const warnings=Array.isArray(res.warnings)?res.warnings:[];
+  const showWarnings=(rj)=>{
+    if(!warnings.length) return;
+    const h=document.createElement('div'); h.className='rej'; h.style.color='var(--warn)';
+    h.textContent=`△ 注意 ${warnings.length} 件（注意だけです。これで取り込みが止まることはありません。必要なら入れたあとに直してください）:`;
+    rj.appendChild(h);
+    for(const w of warnings){ const d=document.createElement('div'); d.className='rej'; d.style.color='var(--warn)';
+      d.textContent=importWarnText(w); rj.appendChild(d); }
+  };
+  // 別の科の当直表は取り込まない（20260923: 他の科の予定を自科として出してしまうのを防ぐ）
+  if(namekey(res.owner)!==namekey(owner)){
+    alert(`このExcelは「${res.owner||'(科名なし)'}」の当直表です。いま選んでいる科（${owner}）とは違うので取り込みません。\n`
+      +'上の科の選択を合わせてから取り込んでください。');
+    return;
+  }
+  $('#impApply').disabled=false;
+
+  // 対象月と違う月＝当直交代の申請。画面には反映せず、その月のマスターへ書き戻す
+  if(res.year!==cfg.year||res.month!==cfg.month){
+    pendingImport=null; pendingOther=null;
+    const ym=`R${res.year-2018}年${res.month}月`;
+    const lines=changes.map(c=>`${c.date} 〔${c.band}〕${c.kind}: ${c.from||'(なし)'} → ${c.to||'(なし)'}`);
+    const rj=$('#impRejs'); rj.innerHTML='';
+    let stale=null, ent=null;
+    // 読めなかった行があるまま書くと、その割当がその月の予定から黙って消える（20260923）→ 記録しない
+    if(rejects.length){
+      $('#impOk').textContent=`${ym} の当直表に読めなかった行が ${rejects.length} 件あります。`
+        +'Excel を直してから取り込み直してください（記録しません）';
+      $('#impApply').disabled=true;
+    }else{
+      // その月の予定を、この Excel を書き出したあとに誰かが変えていないか（古い Excel で後の変更を黙って戻さない。20260925）
+      const mr=await window.td.loadMaster({year:res.year,month:res.month});
+      if(!mr||!mr.ok){
+        $('#impOk').textContent=`${ym} の共有の当直予定表が読めません（記録しません）: `+((mr&&mr.error)||'');
+        $('#impApply').disabled=true;
+      }else if(!mr.master){
+        $('#impOk').textContent=`${ym} の共有の当直予定表がありません。その月にはアプリで出した予定がないので、記録できません`;
+        $('#impApply').disabled=true;
+      }else{
+        ent=(mr.master.depts||{})[owner]||null;
+        if(ent&&!Object.keys(ent).length) ent=null;
+        if(!ent){
+          // その月にこの科の予定（名簿つき）が無い＝名簿の無いエントリを作ってしまう。断る（20261009）
+          $('#impOk').textContent='その月はまだアプリで提出していません。その月のフォルダのアプリで開いて入力してください';
+          $('#impApply').disabled=true;
+        }else{
+          stale=changedSinceExport(res.meta||{},ent);
+          pendingOther={res,duties:fillCodesFrom(duties,ent),expectRev:Number(ent.rev||0)};
+          $('#impOk').textContent=`${ym} の当直交代として申請します（交代 ${changes.length} 件）`;
+        }
+      }
+    }
+    if(stale&&pendingOther){
+      const meta=res.meta||{};
+      const w=document.createElement('div'); w.className='stalebox';
+      const h=document.createElement('div'); h.className='q';
+      h.textContent=`⚠ この Excel を書き出したあとに、${ym} の ${owner} の予定が変更されています`;
+      const p=document.createElement('div');
+      p.textContent=`変更: ${fmtStamp(ent.updated)||'(日時不明)'}　${ent.by||'(入力者不明)'}`
+        +(meta.generated?`（この Excel の書き出し: ${fmtStamp(meta.generated)}）`:'');
+      const p2=document.createElement('div');
+      p2.textContent='このまま申請すると、その変更は取り消され、この Excel の内容に置き換わります。'
+        +'ふつうは「やめる」を押し、アプリから書き出し直した Excel で交代を入れ直してください。';
+      const lab=document.createElement('label'); lab.className='staleok';
+      const cb=document.createElement('input'); cb.type='checkbox'; cb.id='impStaleOk';
+      cb.addEventListener('change',()=>{ $('#impApply').disabled=!cb.checked; });
+      lab.append(cb,document.createTextNode(' 上の変更を取り消して、この Excel の内容で申請する'));
+      w.append(h,p,p2,lab); rj.appendChild(w);
+      $('#impApply').disabled=true;          // 既定は申請しない（チェックを入れたときだけ押せる）
+    }
+    for(const t of lines.concat(rejects.map(x=>(x.line?`${x.line}行目: `:'')+x.why))){
+      const d=document.createElement('div'); d.className='rej'; d.textContent=t; rj.appendChild(d); }
+    showWarnings(rj);
+    $('#impApply').textContent='この交代を申請する';
+    $('#importOv').style.display='flex';
+    return;
+  }
+
+  // 対象月なら画面へ。原子レコード → マス（枠|日|バンド|slot）
+  //   20260925: 定員（capacity）を超える「当」も落とさずに次の欄へ置く（科の復元と同じ。③の警告で知らせる）
+  //   20260926: 定員超の知らせはヘルパーの warnings[] に一本化（以前はヘルパーが定員超を読めない行として弾いていたので、
+  //   ここで数え直していた定員超の △ は出る場面が無かった）
+  pendingOther=null;
+  const next=new Map(), placeable=[], dupSkipped=[], seen=new Set();
+  for(const a of duties){
+    const f=ownFrames.find(x=>x.frame_id===a.frame_id); if(!f) continue;
+    const k=`${f.frame_id}|${a.date}|${a.band}`;
+    // 同じ人が同じ欄（枠×日×昼夜）に2回書かれていても1人分だけ入れる（20260923）。黙らずに △ で知らせる（20260926）
+    if(seen.has(`${k}|${a.staff_login}`)){ dupSkipped.push(a); continue; }
+    seen.add(`${k}|${a.staff_login}`);
+    const s=next.get(k)||0;
+    placeable.push({...a,slot:s}); next.set(k,s+1);
+  }
+  const rj=$('#impRejs'); rj.innerHTML='';
+  // 読めなかった行があるまま入れると、その行の割当がカレンダーから（提出するとマスターからも）黙って消える
+  //   → 取り込まない。Excel を直して取り込み直してもらう（違う月の取込と同じ扱い。20260925）
+  if(rejects.length){
+    pendingImport=null;
+    $('#impOk').textContent=`読めなかった行が ${rejects.length} 件あります。このままではカレンダーに入れません。`
+      +'下の行を Excel で直して上書き保存し、もう一度取り込んでください（いまのカレンダーは変わりません）';
+    $('#impApply').disabled=true;
+  }else{
+    pendingImport=placeable;
+    // 文言は画面の言葉で（20260914 ユーザー指摘: 「マス」「備考」では通じない）
+    $('#impOk').textContent=`読めた割当 ${placeable.length} 件（カレンダーに入ります）`
+      +(grid.size?'。いまのカレンダーの内容は、このExcelの内容に置き換わります':'');
+  }
+  for(const x of rejects){ const d=document.createElement('div'); d.className='rej';
+    d.textContent=(x.line?`${x.line}行目: `:'')+x.why; rj.appendChild(d); }
+  showWarnings(rj);
+  for(const o of dupSkipped){ const d=document.createElement('div'); d.className='rej'; d.style.color='var(--warn)';
+    d.textContent=importWarnText({date:o.date,band:o.band,name:o.name,why:'同じ人が同じ欄に2回書かれていたので、1回だけ入れます'});
+    rj.appendChild(d); }
+  const notes=res.notes||[];
+  if(notes.length){
+    const h=document.createElement('div'); h.className='rej';
+    h.textContent=`Excelの各週の下の空き行（欄に入り切らなかった人などが書かれる行）に文字がありました。ここはカレンダーに入りません。必要なら取り込んだあとに手で足してください:`;
+    rj.appendChild(h);
+    for(const nt of notes){ const d=document.createElement('div'); d.className='rej';
+      const dd=String(nt.date||''); d.textContent=`　${dd?`${+dd.slice(5,7)}月${+dd.slice(8,10)}日`:''} ${nt.text}`; rj.appendChild(d); }
+  }
+  $('#impApply').textContent='カレンダーに入れる';
+  $('#importOv').style.display='flex';
+}
+$('#impCancel').addEventListener('click',()=>{ pendingImport=null; pendingOther=null; $('#importOv').style.display='none'; });
+$('#impApply').addEventListener('click',async()=>{
+  if(pendingOther){
+    const {res,duties,expectRev}=pendingOther;
+    const stOk=$('#impStaleOk');
+    if(stOk&&!stOk.checked) return;              // 後の変更を取り消す確認が済んでいない
+    // roster はその月のものを残す（当時のメンバーが正）。changes も送らない（既存の記録はそのまま。
+    //   交代の記録は版の差分から別のジョブが作る。20260923）
+    // 20260925: 取り込む前に読んだ rev と照らす（確かめたあとに誰かが保存していたら書かない＝黙って戻さない）
+    const r=await window.td.saveDept({owner,year:res.year,month:res.month,by:'app',expectRev,
+      ent:{duties}});
+    // 決裁済みの月なら交代申請（承認されたものだけ15時に反映。20260924）
+    alert(r&&r.ok?`R${res.year-2018}年${res.month}月 の交代を申請しました`
+                   +(r.confirmed?'（承認されると15時に当直表に反映されます）':'（その月はまだ決裁前なので、そのまま予定に入りました）')
+                 :r&&r.conflict?`申請していません。R${res.year-2018}年${res.month}月 の予定は、いま ${fmtStamp(r.updated)} に ${r.by||'別の誰か'} が更新しました。`
+                   +'アプリから書き出し直した Excel で、もう一度取り込んでください'
+                 :'申請できませんでした: '+((r&&r.error)||''));
+    pendingOther=null; $('#importOv').style.display='none';
+    return;
+  }
+  if(pendingImport){
+    // 取り込んだ Excel はこの科のこの月の全部＝自科の枠の割当をいったん全部外してから入れる
+    //   （20260923: 足し算にしていたので、Excel で消した人が画面に残っていた）
+    const fids=new Set(ownFrames.map(f=>f.frame_id));
+    for(const key of [...grid.keys()]) if(fids.has(key.split('|')[0])) grid.delete(key);
+    for(const a of pendingImport){
+      ensurePerson(a.staff_login,{code:a.staff_code,name:a.name,unregistered:a.unregistered});
+      if(!members.includes(a.staff_login)&&byLogin.has(a.staff_login)) members.push(a.staff_login);
+      grid.set(`${a.frame_id}|${a.date}|${a.band}|${a.slot}`,{login:a.staff_login,oncall:!!a.oncall});
+    }
+  }
+  pendingImport=null; $('#importOv').style.display='none';
+  reconcileShare(); normalizeShare();
+  renderChips(); renderShareBar(); renderGrid(); refresh();
+});
+$('#importBtn').addEventListener('click',()=>doImport());
+window.__tdDebug={doImport,runChecks,isToban,frames:()=>ownFrames,grid:()=>grid,cfg:()=>cfg};   // 自動検証用（main.js の TD_DEBUG_IMPORT から呼ぶ。通常の動作には使わない）
+// ②の欄へ xlsx をドラッグ＆ドロップ（20260914 ユーザー指示）。ボタンでもカレンダーでも落とせる
+{
+  const zone=$('#gridSec');
+  const isFileDrag=e=>e.dataTransfer&&Array.from(e.dataTransfer.types||[]).includes('Files');
+  zone.addEventListener('dragover',e=>{ if(!isFileDrag(e)) return; e.preventDefault(); e.dataTransfer.dropEffect='copy'; zone.classList.add('dragover'); });
+  zone.addEventListener('dragleave',e=>{ if(!zone.contains(e.relatedTarget)) zone.classList.remove('dragover'); });
+  zone.addEventListener('drop',e=>{
+    zone.classList.remove('dragover');
+    if(!isFileDrag(e)) return;
+    e.preventDefault();
+    const files=Array.from(e.dataTransfer.files||[]);
+    const f=files.find(x=>/\.xlsx$/i.test(x.name));
+    if(!f){ alert('当直表の xlsx を落としてください（'+(files[0]?files[0].name:'ファイルなし')+'）'); return; }
+    const p=window.td.pathForFile(f);
+    if(!p){ alert('ファイルの場所が取れませんでした。「Excelから取り込む」ボタンから選んでください'); return; }
+    doImport(p);
+  });
+  // ページ全体では既定の「ファイルを開く」を抑止（欄の外へ落としても画面が置き換わらないように）
+  window.addEventListener('dragover',e=>{ if(isFileDrag(e)) e.preventDefault(); });
+  window.addEventListener('drop',e=>{ if(isFileDrag(e)) e.preventDefault(); });
+}
+
+
+// ---- 提出 ----
+function buildSubmission(){
+  return {schema:'hospital.duty-submission/1',year:cfg.year,month:cfg.month,dept:owner,
+    submitted_at:(new Date()).toISOString().slice(0,19),
+    by:IS_APP?'app':'browser',
+    roster:members.map(lg=>rosterEntryOf(byLogin.get(lg),workOf(lg),segToSave(lg))),   // work（3区分）＋ in_house（20260927）
+    duties:buildDuties()};
+}
+let submitChecking=false;
+$('#submitBtn').addEventListener('click',async()=>{
+  if(submitChecking) return;
+  const {errs}=runChecks(); if(errs.length){refresh();return;}
+  // 提出の直前に、この月が決裁された（または決裁が取り消された）かを読み直す（20260926）。
+  //   開いたままの画面は起動したときの状態のままなので、変わっていたら画面を切り替えて、先に知らせる。
+  //   読めなければここでは止めない（保存のときに同じ共有を読むので、そこで知らせる）
+  let told=false;
+  if(IS_APP){
+    submitChecking=true; $('#submitBtn').disabled=true;
+    let mr=null;
+    try{ mr=await window.td.loadMaster({year:cfg.year,month:cfg.month}); }catch(_){ mr=null; }
+    submitChecking=false;
+    const ch=(mr&&mr.ok)?syncConfirmed(confirmedOf(mr),mr.master):null;
+    refresh();
+    if(ch){
+      told=true;
+      if(!confirm(CONFIRM_CHANGED_MSG[ch]+'よろしいですか？')) return;
+    }
+  }
+  // 決裁済みの月も出し直せる。変更は交代申請＝承認されたものだけ15時に反映（20260923 / 20260924）
+  // 20260927 管理者: 決裁済みの月の「交代申請になります…」の確認ダイアログは不要（帯・題名・ボタンの表記で分かる）
+  $('#cfDept').textContent=(owner==='管理者'?'管理者（手作業枠）':owner);
+  $('#cfYm').textContent=`${cfg.reiwa}年${cfg.month}月`;
+  const du=buildDuties();
+  $('#cfSub').textContent=`入力 ${du.length} 件（当直 ${du.filter(x=>!x.oncall).length}・オンコール ${du.filter(x=>x.oncall).length}。昼・夜は別々に数えます）／ 名簿 ${members.length} 名`;
+  // 交代申請のときは全体の件数ではなく「誰から誰へ」を出す（20260927 管理者）
+  $('#cfSub').style.display='none';   // 全体の件数は出さない（交代申請は 20260927、提出も 20260929 管理者）
+  renderKotaiConfirm(du);
+  renderShozokuConfirm();
+  $('#confirmOv').style.display='flex';
+});
+$('#cfNo').addEventListener('click',()=>$('#confirmOv').style.display='none');
+// 提出（交代申請）の確認に「Dr.JOY の所属医師」の変化を出す（20260927 管理者。所属の申告になる提出単位だけ）
+function renderKotaiConfirm(du){
+  const box=$('#cfKotai'); box.innerHTML='';
+  if(!cfg.confirmed){ box.style.display='none'; return; }
+  const ch=kotaiChanges(savedDuties,du);
+  const nm=lg=>{ const p=byLogin.get(lg); return p?namekey(p.name):lg; };
+  const who=xs=>xs.length?xs.map(x=>`${nm(x.login)}（${x.oncall?'オ':'当'}）`).join('・'):'（なし）';
+  if(!ch.length){
+    const d=document.createElement('div'); d.textContent='当直の変更はありません（名簿を直しただけです）'; box.appendChild(d);
+  }
+  for(const c of ch.slice(0,40)){
+    const f=ownFrames.find(x=>x.frame_id===c.frame_id)||{};
+    const d0=(cfg.days||[]).find(x=>x.date===c.date)||{day:+c.date.slice(8,10),weekday:''};
+    const band=c.bands.length>1?'昼夜':c.bands[0];
+    const row=document.createElement('div');
+    const w=document.createElement('span'); w.className='when';
+    w.textContent=`${+c.date.slice(5,7)}月${d0.day}日${d0.weekday?'('+d0.weekday+')':''} ${band} ${frameDisp(f)}`;
+    const a=document.createElement('span'); a.className='arrow'; a.textContent='→';
+    row.append(w,document.createTextNode(who(c.from)),a,document.createTextNode(who(c.to)));
+    box.appendChild(row);
+  }
+  if(ch.length>40){ const d=document.createElement('div'); d.className='when'; d.textContent=`ほか ${ch.length-40} 件`; box.appendChild(d); }
+  box.style.display='block';
+}
+function renderShozokuConfirm(){
+  const box=$('#cfShozoku'); box.innerHTML='';
+  // 決裁後（交代申請）は「外れる」だけ出す: 月が始まった後の所属の変更は来月の名簿で（20260927 管理者）。
+  //   決裁後も当直の無い医師は外せる（20261028 管理者）ので、その確認のために外れる医師は見せる
+  if(!isDefining(owner)){ box.style.display='none'; return; }
+  const afterOnly=!!cfg.confirmed;
+  const df=shozokuDiff({members,personOf:lg=>byLogin.get(lg),doctors,deptEntry:deptEntryOf(owner),
+    nonDuty:SHZ.non_duty_depts,excludeRanks:SHZ.exclude_ranks,prevWork:savedWork||prevMonthWork||'full',workOf,nameKey:canon,
+    chosen:isComposite(owner)?new Map(members.filter(segToSave).map(lg=>[lg,segToSave(lg)])):null});
+  const add=(tag,text,cls)=>{ const el=document.createElement(tag); if(cls) el.className=cls; el.textContent=text; box.appendChild(el); return el; };
+  const deptDisp=p=>deptSegs(p.dept).join('・');
+  const who=(p,sub)=>{ const el=add('div',namekey(p.name),'who');
+    const s=document.createElement('span'); s.className='sub'; s.textContent=sub; el.appendChild(s); };
+  add('h4','Dr.JOY の所属医師');
+  if(afterOnly){ df.add=[]; df.addNonDuty=[]; }   // 決裁後に見せるのは 外れる と 区分が変わる（20261028）
+  const n=df.add.length+df.addNonDuty.length+df.remove.length+df.changed.length;
+  if(!n){ if(afterOnly){ box.style.display='none'; return; } add('div','所属医師の変更はありません'); box.style.display='block'; return; }
+  if(df.add.length){ add('div',`加わる（${df.add.length}名）`,'grp');
+    // 集合当直では、どちらの「Dr.JOY所属」に加えるか（選んでいなければ、選ぶよう促す。20261031）
+    const where=p=>!isComposite(owner)?'':p.seg?` → ${p.seg}`:'（左の名簿で、どちらの「Dr.JOY所属」か選んでください）';
+    for(const p of df.add) who(p,`${p.title||''}／いまの所属: ${deptDisp(p)}${where(p)}`); }
+  if(df.addNonDuty.length){ add('div',`当直をしない部署の医師（所属はそのまま）（${df.addNonDuty.length}名）`,'grp');
+    for(const p of df.addNonDuty) who(p,`${p.title||''}／${deptDisp(p)}`); }
+  if(df.remove.length){ add('div',`外れる（${df.remove.length}名）`,'grp');
+    for(const p of df.remove) who(p,`${p.title||''}／いまの所属: ${deptDisp(p)}`); }
+  if(df.changed.length){ add('div',`区分が変わる（${df.changed.length}名）`,'grp');
+    for(const c of df.changed) who(c.p,`${WORK_LABEL[c.from]} → ${WORK_LABEL[c.to]}`); }
+  add('div','違っていれば「いいえ・戻る」を押して、左の名簿を直してください。','sub').style.marginTop='6px';
+  box.style.display='block';
+}
+// 保存の結果の confirmed（保存した時点でその月が決裁済みだったか）で完了の言葉を決める（20260926）。
+//   提出の直前に確かめたあと、保存までの間に③確定・解除された場合は、画面もここで切り替える。返り値 = 交代申請だったか
+async function afterSaved(r){
+  if(typeof r.confirmed!=='boolean') return !!cfg.confirmed;
+  if(r.confirmed!==!!cfg.confirmed){
+    let mr=null;
+    try{ mr=await window.td.loadMaster({year:cfg.year,month:cfg.month}); }catch(_){ mr=null; }
+    syncConfirmed((mr&&mr.ok)?confirmedOf(mr):(r.confirmed?true:null),(mr&&mr.ok)?mr.master:null);
+  }
+  $('#doneMsg').textContent=r.confirmed?'交代を申請しました':'提出が完了しました';
+  return r.confirmed;
+}
+$('#cfYes').addEventListener('click',async()=>{
+  $('#confirmOv').style.display='none';
+  const sub=buildSubmission();
+  if(IS_APP){
+    const r=await window.td.saveDept({owner,year:cfg.year,month:cfg.month,by:'app',expectRev:myRev,
+      ent:{duties:sub.duties,roster:sub.roster}});
+    if(r&&r.ok){
+      myRev=r.rev; hasSaved=true; markClean(); refreshDirty();
+      const kotai=await afterSaved(r);
+      $('#doneSub').textContent=kotai?`交代を申請しました（承認されると15時に当直表に反映されます）（${owner}・rev ${r.rev}）`
+        :`共有の当直予定表に保存しました（${owner}・rev ${r.rev}）`;
+      $('#doneOv').style.display='flex';
+    }else if(r&&r.conflict){
+      // 20261009: 上書きはさせない（以前は OK で他の人の提出を消していた）。最新を読み直して入れ直してもらう
+      const when=fmtStamp(r.updated)||'少し前';
+      $('#footErr').textContent=`提出していません。この科の予定は ${when} に別の人が保存しています`;
+      if(confirm(`提出していません。この科の予定は ${when} に別の人が保存しています。\n\n`
+        +'OK を押すと、共有の最新の予定を読み直して画面に出します。いま画面にある、まだ提出していない変更は消えます。\n'
+        +'読み直したら、内容を確かめてから、変更を入れ直して提出してください。\n\n'
+        +'いまの画面を控えておきたいときは「キャンセル」を押し、先に「Excelに書き出す」で保存してください'
+        +'（キャンセルすると提出しないまま、この画面に戻ります）。')){
+        if(await reloadDept())
+          $('#footErr').textContent='最新の予定を読み直しました。内容を確かめてから、変更を入れ直して提出してください';
+      }
+    }else{
+      $('#footErr').textContent='保存できませんでした（共有フォルダに書き込めません）: '+((r&&r.error)||'');
+    }
+  }else{
+    const name=`R${cfg.reiwa}年${cfg.month}月（${owner.replace(/[ 　\/]/g,'')}）.json`;
+    const blob=new Blob([JSON.stringify(sub,null,1)],{type:'application/json'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; a.click();
+    markClean(); refreshDirty();
+    $('#doneSub').textContent=`「${name}」をダウンロードしました。案内されたメール宛先へ添付して送ってください。`;
+    $('#doneOv').style.display='flex';
+  }
+});
+$('#doneClose').addEventListener('click',()=>$('#doneOv').style.display='none');
+
+// 前月に同じ科が出したエントリ（roster があるものだけ）。前月の月フォルダ・予定が無い／読めなければ null（黙って既定に戻す。20260927）
+async function loadPrevMonthEnt(o){
+  if(!IS_APP||!o) return null;
+  const py=cfg.month===1?cfg.year-1:cfg.year, pm=cfg.month===1?12:cfg.month-1;
+  // 予行の月（R8.10 など）は前の月として使わない（区分・名簿外を引き継がない・区分の変化も比べない。20260927）
+  if(isRehearsalMonth(py,pm,(cfg.shozoku&&cfg.shozoku.real_from)||'2026-11')) return null;
+  try{
+    const mr=await window.td.loadMaster({year:py,month:pm});
+    if(!mr||!mr.ok||!mr.master) return null;
+    const ent=(mr.master.depts||{})[o];
+    return ent&&Array.isArray(ent.roster)?ent:null;
+  }catch(_){ return null; }
+}
+// ---- 科の切替（前回提出の復元つき）----
+//   20261009: 関数にした。保存が他の人の保存と競合したとき、同じ科を読み直すのにも使う（reloadDept）
+async function selectDept(){
+  const sel=$('#deptSel'), next=sel.value||null;
+  // 提出していない変更があれば確かめる。やめたら選択を元に戻す（20260923）
+  if(owner&&next!==owner&&isDirty()
+     &&!confirm(`${owner} の変更はまだ提出されていません。科を切り替えると失われます。切り替えますか？`)){
+    sel.value=owner; return;
+  }
+  // 共有マスターを読み直す（起動時の写しのままだと、その後の他の人の保存や rev が反映されない。20260923）
+  //   20260927: 前月の予定（同じ科の名簿）も一緒に読む（前月からの引き継ぎと、提出の確認の「区分が変わる」）
+  let pmEnt=null;
+  if(next&&IS_APP){
+    const [mr,pe]=await Promise.all([window.td.loadMaster({year:cfg.year,month:cfg.month}),loadPrevMonthEnt(next)]);
+    pmEnt=pe;
+    if((sel.value||null)!==next) return;        // 待っている間に別の科が選ばれた
+    if(!mr||!mr.ok){
+      alert('共有の当直予定表が読めません（共有フォルダに繋がっていない可能性があります）: '+((mr&&mr.error)||''));
+      sel.value=owner||''; return;
+    }
+    master=mr.master;
+    // 起動したあとに③確定（または解除）されていれば、ここで画面を切り替えて知らせる（20260926。1日開きっぱなしの画面向け）。
+    //   決裁のときの割当（baseIdx）は下でこの科を描くときに cfg.confirmed から作り直す
+    const ch=confirmChange(cfg.confirmed,confirmedOf(mr));
+    if(ch){ cfg.confirmed=confirmedOf(mr); applyConfirmedUI(); alert(CONFIRM_CHANGED_MSG[ch]); }
+  }
+  // 20261009: 切り替えると決まってから落とす（以前は確認の前に落としていて、やめると前の科のまま false になっていた）
+  hasSaved=false;
+  owner=next;
+  try{ localStorage.setItem('td.lastOwner',owner||''); }catch(_){}   // 次に開いたときこの科で開く（20260925）
+  grid=new Map(); members=[]; workMap=new Map(); segMap=new Map();
+  prevMonthWork=pmEnt?new Map(pmEnt.roster.filter(e=>e&&e.login).map(e=>[e.login,normWork(e)])):null;
+  let prevDuties=null;                 // この月に既に入力があるか（昼夜共通スイッチの初期状態の判定に使う）
+  if(owner){
+    ownFrames=cfg.frames.filter(f=>isActive(f)&&(f.owner||f.dept)===owner);
+    members=defaultMembers(owner);
+    let prev=null;
+    if(IS_APP&&master){ prev=(master.depts||{})[owner]||null; myRev=prev?Number(prev.rev||0):null; }
+    // 決裁済みの月は、決裁のときの割当と比べて変わったマスを赤くする（決裁のときに入力が無かった科は全部が変更）
+    baseIdx=cfg.confirmed?buildBaseIdx((prev&&prev.baseline)||[]):null;
+    if(prev&&prev.duties){
+      prevDuties=prev.duties;
+      // Dr.JOY未登録の手入力医師（名簿外）と、いまの名簿から消えた医師（名簿に無い・20260923）は
+      // cfg.roster に居ないので、前回提出の roster/duties から復元する（黙って落とさない）
+      for(const p of prev.roster||[]) ensurePerson(p.login,p);
+      for(const r of prev.duties)
+        ensurePerson(r.staff_login,{code:r.staff_code,name:r.name,unregistered:r.unregistered});
+      members=(prev.roster||[]).map(p=>p.login).filter(lg=>byLogin.has(lg));
+      hasSaved=!!(prev.roster&&prev.roster.length);   // この月に出した名簿がある（区分の比べる相手。20260927）
+      // 区分: work（20260927〜）。無い古い版は in_house で読む（false=当直のみ → パートタイム）
+      for(const p of prev.roster||[])
+        if(byLogin.has(p.login)){ setWork(p.login,normWork(p)); if(p.seg) segMap.set(p.login,p.seg); }
+      // 原子レコード → マス（キーは 枠|日|バンド|slot。データは常に昼/夜の2本のまま）。
+      //   20260925: 定員（capacity）を超える「当」も落とさずに次の欄へ置く（落とすと次の提出でマスターから消えていた）。
+      //   定員超は ③ の警告（「当」が n 名います）で知らせるだけ＝画面で直せる
+      const used=new Map();   // gk(枠|日|バンド) -> {duty,next}
+      for(const r of prev.duties){
+        const f=ownFrames.find(x=>x.frame_id===r.frame_id); if(!f) continue;
+        if(r.band!=='昼'&&r.band!=='夜') continue;
+        const gk=`${f.frame_id}|${r.date}|${r.band}`;
+        const u=used.get(gk)||{duty:0,next:0};
+        // 既に同じ人が同じ枠×日×バンドに入っていれば skip（重複提出の防御）
+        let found=false;
+        for(let s=0;s<u.next;s++){
+          const g=grid.get(`${gk}|${s}`);
+          if(g&&g.login===r.staff_login){found=true;break;}
+        }
+        if(found) continue;
+        if(!r.oncall) u.duty++;
+        grid.set(`${gk}|${u.next}`,{login:r.staff_login,oncall:!!r.oncall});
+        u.next++; used.set(gk,u);
+        if(!members.includes(r.staff_login)&&byLogin.has(r.staff_login)) members.push(r.staff_login);
+      }
+    }else if(pmEnt&&!((cfg.fixedMembers||{})[owner]||[]).length){
+      // まだ提出していない月 → 前月に同じ科が出した名簿から引き継ぐ（20260927 管理者）。
+      //   院外研修期間表からの初期区分（ingai_week5）はやめた（計画で、実際と違う人が多い）。
+      //   決まった初期メンバーのある提出単位（管理当直）は従来どおり引き継がない
+      const co=carryOverMembers({defaults:members,prevRoster:pmEnt.roster,people:byLogin,
+        deptEntry:deptEntryOf(owner),nonDuty:SHZ.non_duty_depts,excludeRanks:SHZ.exclude_ranks});
+      for(const e of co.carried) ensurePerson(e.login,e);
+      members=co.members.filter(lg=>byLogin.has(lg));
+      for(const [lg,w] of Object.entries(co.work)) setWork(lg,w);
+      for(const [lg,sg] of Object.entries(co.seg||{})) segMap.set(lg,sg);
+    }
+  } else ownFrames=[];
+  // 20260922: スイッチの初期状態はこの月の実データから（入力があれば土日祝の昼夜一致で判定）。
+  //   まだ何も入っていない科は前月のタイプを引き継ぐ（applyPrevTypes・非同期）
+  const hasData=!!(prevDuties&&prevDuties.length);
+  buildShareGroups(); computeShare(hasData); normalizeShare();
+  $('#main').style.display=owner?'flex':'none';
+  $('#footer').style.display=owner?'flex':'none';
+  renderChips(); renderShareBar(); renderGrid(); markClean(); refresh();
+  renderChips();     // markClean で保存済みの名簿が決まるので、決裁後の × の可否を描き直す（20261028: 科を切り替えると前の科の名簿のままだった）
+  if(owner&&!hasData) applyPrevTypes();
+  return true;                          // 読み込めた（途中で戻ったときは undefined）
+}
+$('#deptSel').addEventListener('change',()=>selectDept());
+// いまの科を共有の当直予定表から読み直す（決裁の状態・rev も読み直す。20261009）
+async function reloadDept(){
+  if(!owner) return;
+  $('#deptSel').value=owner;
+  return await selectDept();
+}
+// 2回目からは、前回選んだ科で開く（管理者 20260925）。覚えるのはこの PC・この Windows アカウント（アプリの保存領域）。
+//   その月に無い科（名前が変わった・消えた）なら何も選ばない
+{ let last='';
+  try{ last=localStorage.getItem('td.lastOwner')||''; }catch(_){}
+  const sel=$('#deptSel');
+  if(last&&!sel.value&&[...sel.options].some(o=>o.value===last)){ sel.value=last; sel.dispatchEvent(new Event('change')); }
+}
+
+// desktop shortcut (Electronのみ)
+})();
+</script>
+</body>
+</html>
